@@ -332,6 +332,7 @@ const help_text = `
 • <code>${commandName} api reset</code> - 重置为默认后端 API
 
 默认文字语录使用深紫渐变玻璃气泡（圆角、细描边、顶部高光）。
+自动带上发送者在当前群的成员标签；四周留白更宽，高光保持原样。
 带媒体的语录仍使用原增强版 API；自定义 API 需支持 glass 样式。
 `;
 
@@ -408,6 +409,138 @@ const QUOTE_APPEARANCE = {
   style: "glass",
   backgroundColor: "#302737/#221d2a",
 };
+
+async function getQuoteSenderTag(message: any, sender: any, client: any, cache: Map<string, Promise<any>>) {
+  // 转发消息使用原作者，不能把转发者在当前群的标签贴到原作者身上。
+  if (message.fwdFrom || !sender?.id || message.fromId instanceof Api.PeerChannel) return {};
+  const peer = message.peerId;
+  if (!(peer instanceof Api.PeerChannel) && !(peer instanceof Api.PeerChat)) return {};
+  const directRank = message.fromRank ?? message.from_rank;
+  // 新版超级群消息自带 from_rank，直接使用消息上的标签，无需额外查询。
+  if (typeof directRank === "string" && directRank.trim()) {
+    return { senderTag: directRank.trim(), senderTagRole: "admin" };
+  }
+  try {
+    let participant: any;
+    if (peer instanceof Api.PeerChannel) {
+      const key = `channel:${peer.channelId}:${sender.id}`;
+      if (!cache.has(key)) cache.set(key, (async () => {
+        const input = await client.getInputEntity(peer);
+        const result = await client.invoke(new Api.channels.GetParticipant({
+          channel: new Api.InputChannel({ channelId: input.channelId, accessHash: input.accessHash }),
+          participant: await client.getInputEntity(sender),
+        }));
+        return result.participant;
+      })());
+      participant = await cache.get(key);
+    } else {
+      const key = `chat:${peer.chatId}`;
+      if (!cache.has(key)) cache.set(key, client.invoke(new Api.messages.GetFullChat({ chatId: peer.chatId })));
+      const full = await cache.get(key);
+      const members = full.fullChat?.participants;
+      participant = (members?.participants || [members?.selfParticipant]).find((member: any) =>
+        member?.userId?.toString() === sender.id.toString());
+    }
+    const kind = participant?.className || participant?.constructor?.name || "";
+    const owner = /ParticipantCreator$/.test(kind);
+    const admin = /ParticipantAdmin$/.test(kind);
+    const rank = typeof participant?.rank === "string" ? participant.rank.trim() : "";
+    const text = rank || (owner ? "群主" : admin ? "管理员" : "");
+    // Quote API 的绿色胶囊预设名为 admin；普通成员标签也用绿色胶囊展示。
+    return text ? { senderTag: text, senderTagRole: owner ? "owner" : "admin" } : {};
+  } catch {
+    // 旧协议或无权查询成员时仍正常生成语录。
+    return {};
+  }
+}
+
+/** 扩大气泡内边距，复用原文字图层和 glass 高光参数。 */
+async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
+  const sharp = (await import("sharp")).default;
+  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { width, height } = info;
+  const seen = new Uint8Array(width * height);
+  const parts: any[] = [];
+  for (let seed = 0; seed < seen.length; seed++) {
+    if (seen[seed] || data[seed * 4 + 3] < 128) continue;
+    const pixels = [seed];
+    seen[seed] = 1;
+    let left = width, right = 0, top = height, bottom = 0;
+    for (let i = 0; i < pixels.length; i++) {
+      const pixel = pixels[i], x = pixel % width, y = Math.floor(pixel / width);
+      left = Math.min(left, x); right = Math.max(right, x);
+      top = Math.min(top, y); bottom = Math.max(bottom, y);
+      for (const next of [x ? pixel - 1 : -1, x + 1 < width ? pixel + 1 : -1, y ? pixel - width : -1, y + 1 < height ? pixel + width : -1]) {
+        if (next >= 0 && !seen[next] && data[next * 4 + 3] >= 128) {
+          seen[next] = 1; pixels.push(next);
+        }
+      }
+    }
+    parts.push({ left, right, top, bottom, pixels });
+  }
+  const avatars = parts.filter(p => p.left === 0 && p.right >= 7 && Math.abs(p.right + 1 - (p.bottom - p.top + 1)) <= 3);
+  if (!avatars.length) return buffer;
+  const scale = (avatars[0].right + 1) / 50;
+  const bubbles = parts.filter(p => p.left > 1 && p.right - p.left + 1 >= 90 * scale && p.pixels.length > (p.right - p.left + 1) * (p.bottom - p.top + 1) * 0.65)
+    .sort((a, b) => a.top - b.top);
+  if (!bubbles.length) return buffer;
+  // 按参考图保持紧凑比例：原内边距 16px → 18px，不缩放字形。
+  const extra = Math.max(1, Math.round(2 * scale));
+  const outWidth = width + extra * 2, outHeight = height + bubbles.length * extra * 2;
+  const layers: any[] = [];
+  let start = 0;
+  for (const [index, bubble] of bubbles.entries()) {
+    const end = index + 1 < bubbles.length ? Math.floor((bubble.bottom + bubbles[index + 1].top) / 2) + 1 : height;
+    const bandAvatars = avatars.filter(p => (p.top + p.bottom) / 2 >= start && (p.top + p.bottom) / 2 < end);
+    const middle = Math.floor((bubble.top + bubble.bottom) / 2);
+    const bodyLeft = Math.min(...bubble.pixels.filter((pixel: number) => Math.floor(pixel / width) === middle).map((pixel: number) => pixel % width));
+    const oldW = bubble.right - bodyLeft + 1, oldH = bubble.bottom - bubble.top + 1;
+    const w = oldW + extra * 2, h = oldH + extra * 2, offsetY = index * extra * 2;
+    // 参考图的圆角与正文字号比例约为 1.1，保持饱满且紧凑。
+    const radius = Math.min(27 * scale, w / 2, h / 2), grouped = 7 * scale;
+    // 相邻气泡原来的小圆角可由边角 alpha 判断，保留同人连续消息的分组形状。
+    const probe = Math.max(1, Math.round(3 * scale));
+    const round = (x: number, y: number) => data[(y * width + x) * 4 + 3] >= 128 ? grouped : radius;
+    const radii = [round(bodyLeft + probe, bubble.top + probe), round(bubble.right - probe, bubble.top + probe), round(bubble.right - probe, bubble.bottom - probe), round(bodyLeft + probe, bubble.bottom - probe)];
+    const tail = bubble.left < bodyLeft - scale ? 14 * scale : 0;
+    const [rTL, rTR, rBR] = radii;
+    // 尾巴附近的 alpha 本来就是实心，不能把它误判为分组的小圆角。
+    const rBL = tail ? radius : radii[3];
+    const shape = `M ${rTL} 0 H ${w - rTR} A ${rTR} ${rTR} 0 0 1 ${w} ${rTR} V ${h - rBR} A ${rBR} ${rBR} 0 0 1 ${w - rBR} ${h} ` +
+      (tail ? `H ${-tail} C ${-tail * 0.4} ${h} 0 ${h - rBL * 0.3} 0 ${h - rBL}` : `H ${rBL} A ${rBL} ${rBL} 0 0 1 0 ${h - rBL}`) +
+      ` V ${rTL} A ${rTL} ${rTL} 0 0 1 ${rTL} 0 Z`;
+    const lw = 2 * scale;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><defs>
+      <linearGradient id="fill" gradientUnits="userSpaceOnUse" x1="${extra}" y1="${extra}" x2="${extra + oldW}" y2="${extra + oldH}"><stop stop-color="#302737"/><stop offset="1" stop-color="#221d2a"/></linearGradient>
+      <linearGradient id="light" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${h * 0.4}"><stop stop-color="white" stop-opacity="0.22"/><stop offset="1" stop-color="white" stop-opacity="0"/></linearGradient>
+      <clipPath id="bubble"><path d="${shape}"/></clipPath>
+      <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${3 * scale}"/></filter>
+      </defs><g transform="translate(${bodyLeft} ${bubble.top + offsetY})">
+      <path d="${shape}" transform="translate(0 ${2 * scale})" fill="black" opacity="0.24" filter="url(#shadow)"/>
+      <path d="${shape}" fill="url(#fill)"/>
+      <g clip-path="url(#bubble)" fill="none"><path d="${shape}" stroke="white" stroke-opacity="0.09" stroke-width="${lw * 2}"/><path d="${shape}" stroke="url(#light)" stroke-width="${lw * 2.6}"/></g></g></svg>`;
+    layers.push({ input: Buffer.from(svg), left: 0, top: 0 });
+    // 光学内边距按可见字形计量；底部多保留一段，以免裁掉字母下伸部。
+    const side = Math.round(16 * scale), above = Math.round(12 * scale), below = Math.round(8 * scale);
+    const content = { left: bodyLeft + side, top: bubble.top + above, width: oldW - side * 2, height: oldH - above - below };
+    if (content.width <= 0 || content.height <= 0) return buffer;
+    layers.push({ input: await sharp(buffer).extract(content).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra });
+    // 头像只移动到底部，大小和内容保持原样。
+    for (const avatar of bandAvatars) {
+      layers.push({ input: await sharp(buffer).extract({ left: avatar.left, top: avatar.top, width: avatar.right - avatar.left + 1, height: avatar.bottom - avatar.top + 1 }).png().toBuffer(), left: avatar.left, top: avatar.top + offsetY + extra * 2 });
+    }
+    start = end;
+  }
+  const output = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(layers).raw().toBuffer();
+  let right = 0, bottom = 0;
+  for (let y = 0; y < outHeight; y++) for (let x = 0; x < outWidth; x++) {
+    if (output[(y * outWidth + x) * 4 + 3]) { right = Math.max(right, x); bottom = Math.max(bottom, y); }
+  }
+  // 优先利用原贴纸的透明区域；超出 Telegram 尺寸时再整体缩小。
+  return sharp(output, { raw: { width: outWidth, height: outHeight, channels: 4 } })
+    .extract({ left: 0, top: 0, width: Math.max(width, right + 1), height: Math.max(height, bottom + 1) })
+    .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
+}
 
 /** 新版 API 只接受远程头像 URL；用本地已下载的头像替换它绘制的圆形占位头像。 */
 async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buffer> {
@@ -581,7 +714,10 @@ class YvluPlugin extends Plugin {
         const sharp = (await import("sharp")).default;
         buffer = await sharp(buffer).resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
       }
-      if (url === DEFAULT_API_URL) buffer = await restoreGlassAvatars(buffer, quoteData.messages);
+      if (url === DEFAULT_API_URL) {
+        buffer = await expandGlassPadding(buffer);
+        buffer = await restoreGlassAvatars(buffer, quoteData.messages);
+      }
       return { buffer, ext: "webp" };
     } catch (error) {
       if (axios.isAxiosError(error)) {
@@ -691,6 +827,7 @@ class YvluPlugin extends Plugin {
           }
 
           const items = [] as any[];
+          const participantCache = new Map<string, Promise<any>>();
           let previousUserIdentifier: string | null = null;
 
           for await (const [i, message] of messages.entries()) {
@@ -917,6 +1054,7 @@ class YvluPlugin extends Plugin {
             }
 
             items.push({
+              ...(shouldShowAvatar ? await getQuoteSenderTag(message, sender, client, participantCache) : {}),
               from: {
                 id: userId ? parseInt(userId) : hashCode(sender.name || `${firstName}|${lastName}`),
                 name: shouldShowAvatar ? name : "",
