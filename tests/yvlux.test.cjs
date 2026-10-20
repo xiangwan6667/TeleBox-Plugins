@@ -80,7 +80,7 @@ const mockRequire = name => {
   if (name === '@utils/tlRevive') return {reviveEntities: e => e};
   return require(name);
 };
-vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;exports._clearHeaders=()=>quoteHeaderCache.clear();exports._fit=fitQuoteArtwork;', {
+vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;exports._clearHeaders=()=>quoteHeaderCache.clear();exports._fit=fitQuoteArtwork;exports._prepare=prepareQuoteSticker;', {
   require: mockRequire, exports: exportsObj, Buffer, console: {log() {}, warn() {}, error() {}},
 });
 const plugin = exportsObj.default;
@@ -101,6 +101,16 @@ async function assertTightArtwork(buffer) {
   assert.ok(bounds.top<=1 && bounds.info.height-1-bounds.bottom<=1,'artwork fills its actual height without transparent top/bottom margins');
   return bounds;
 }
+async function assertQuoteSticker(buffer) {
+  const bounds=await artworkBounds(buffer),{data,info}=bounds;
+  assert.equal(Math.max(info.width,info.height),512,'generated sticker has an exact 512px side for sticker-pack compatibility');
+  assert.ok(buffer.length<=512*1024,'generated static sticker stays within the 512KB upload limit');
+  assert.ok(bounds.left<=1 && info.width-1-bounds.right<=1 && bounds.top<=1,'no outer side or top padding is added');
+  for(let y=Math.max(0,info.height-56);y<info.height;y++)for(let x=Math.max(0,info.width-160);x<info.width;x++) {
+    assert.equal(data[(y*info.width+x)*4+3],0,'bottom-right timestamp area does not cover quote content');
+  }
+  return bounds;
+}
 async function run(command, messages, extra = {}, expectedImages = 1) {
   history = messages; requests = []; sent = []; quoteInputs=[];
   let deleted = false, edits = [];
@@ -118,7 +128,11 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(quoteRequests[0].data.style, 'glass');
   assert.equal(quoteRequests[0].data.backgroundColor, '#302737/#221d2a');
   assert.equal(sent[0].replyTo, messages[0].id);
-  for(const file of sent)await assertTightArtwork(file.bytes);
+  for(const file of sent){
+    const {info}=await assertQuoteSticker(file.bytes);
+    const size=file.attributes.find(attribute=>attribute instanceof Api.DocumentAttributeImageSize);
+    assert.equal(size.w,info.width);assert.equal(size.h,info.height,'sent image dimensions match the encoded sticker');
+  }
   return quoteRequests[0];
 }
 (async () => {
@@ -202,6 +216,16 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   for(let i=0;i<restoredPixels.length;i+=4)if(restoredPixels[i]===255&&restoredPixels[i+1]===255&&restoredPixels[i+2]===255&&restoredPixels[i+3]===255)whiteBefore++;
   for(let i=0;i<enlargedBounds.data.length;i+=4)if(enlargedBounds.data[i]===255&&enlargedBounds.data[i+1]===255&&enlargedBounds.data[i+2]===255&&enlargedBounds.data[i+3]===255)whiteAfter++;
   assert.equal(whiteAfter,whiteBefore,'body glyph pixels keep their exact size');
+  const ready=await exportsObj._prepare(enlarged);
+  const readyBounds=await assertQuoteSticker(ready);
+  assert.ok(readyBounds.info.height-1-readyBounds.bottom>=56,'short quote reserves only a bottom timestamp strip');
+  const cornerFree=await sharp(Buffer.from('<svg width="512" height="512"><rect width="512" height="350" fill="#302737"/><rect y="350" width="150" height="162" fill="#302737"/></svg>')).png().toBuffer();
+  const reusedCorner=await assertQuoteSticker(await exportsObj._prepare(cornerFree));
+  assert.ok(reusedCorner.info.height-1-reusedCorner.bottom<=1,'naturally empty lower-right corner does not add a bottom strip');
+  for(const [width,height]of [[20,10],[50,300],[2000,5]]){
+    const compact=await sharp({create:{width,height,channels:4,background:'#302737'}}).png().toBuffer();
+    await assertQuoteSticker(await exportsObj._prepare(compact));
+  }
   const peer = new Api.PeerChannel({channelId: 20});
   let lookups = 0;
   const tagClient = {
@@ -318,8 +342,8 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.ok(individual.every(request=>request.data.messages.length===1&&request.data.messages[0].avatar),'each retry has a single known message and layout');
   assert.equal(individual[1].data.messages[0].from.first_name,'Author A','continuation restores complete sender metadata');
   const fallbackPixels=await sharp(fallback.buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
-  const fallbackBounds=await assertTightArtwork(fallback.buffer);
-  assert.ok(Math.max(fallbackPixels.info.width,fallbackPixels.info.height)<=512);
+  const fallbackBounds=await assertQuoteSticker(fallback.buffer);
+  assert.equal(Math.max(fallbackPixels.info.width,fallbackPixels.info.height),512);
   let avatarBands=0,avatarInBand=false;
   for(let y=0;y<fallbackPixels.info.height;y++) {
     const alpha=fallbackPixels.data[(y*fallbackPixels.info.width+fallbackBounds.left+15)*4+3];
@@ -333,7 +357,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     omitAvatars=false;joinBubbles=false;
     assert.equal(requests.filter(request=>request.data.type==='png'&&request.data.style==='glass').length,3,`${fault} also takes the structured retry`);
     const recoveredMeta=await sharp(recovered.buffer).metadata();
-    assert.ok(Math.max(recoveredMeta.width,recoveredMeta.height)<=512);
+    assert.equal(Math.max(recoveredMeta.width,recoveredMeta.height),512);
   }
   console.log('PASS: pure emoji/empty-message normalization; incomplete backend layout retries preserve every message, header/tag alignment, uniform scale, and grouped avatars.');
   const tagLive=process.argv.includes('--tag-live');
@@ -416,7 +440,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     if((flags&1)&&count>1&&kind!=='text')assert.equal(apiRequests[0].data.messages[1].replyMessage.media.kind,'story','photo-only reply reserves a thumbnail');
     for(const file of sent) {
       const {data,info}=await sharp(file.bytes).ensureAlpha().raw().toBuffer({resolveWithObject:true});
-      assert.ok(info.width<=512&&info.height<=512);
+      assert.equal(Math.max(info.width,info.height),512);
       let glass=0,blue=0;
       for(let i=0;i<data.length;i+=4){if(data[i+3]>200&&data[i+3]<250&&Math.max(data[i],data[i+1],data[i+2])<90)glass++;if(Math.abs(data[i]-53)<3&&Math.abs(data[i+1]-140)<3&&Math.abs(data[i+2]-187)<3)blue++;}
       assert.ok(glass>10,`${kind}/${selector}/${flags}: visible translucent glass`);

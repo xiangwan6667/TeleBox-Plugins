@@ -949,6 +949,30 @@ async function fitQuoteArtwork(buffer: Buffer, messages: any[] = []): Promise<Bu
   return sharp(fitted).resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
 }
 
+/** 长边必须为 512 才能入包；右下角只补足客户端时间浮层需要的空间。 */
+async function prepareQuoteSticker(buffer: Buffer): Promise<Buffer> {
+  const sharp = (await import("sharp")).default;
+  const limit = 512, timeWidth = 160, timeHeight = 60;
+  // 先留出可能需要的底部高度，再按实际占用决定是否使用，不增加左右或顶部空白。
+  const { data, info } = await sharp(buffer)
+    .resize({ width: limit, height: limit - timeHeight, fit: "inside" })
+    .ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  let lastOccupied = -1;
+  for (let y = Math.max(0, info.height - timeHeight); y < info.height; y++) {
+    for (let x = Math.max(0, info.width - timeWidth); x < info.width; x++) {
+      if (data[(y * info.width + x) * 4 + 3]) { lastOccupied = y; break; }
+    }
+  }
+  const bottom = lastOccupied < 0 ? 0 : Math.max(0, lastOccupied + 1 + timeHeight - info.height);
+  let image = sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } });
+  if (bottom) image = image.extend({ top: 0, left: 0, right: 0, bottom, background: "#00000000" });
+  // 分开两次管线，避免 sharp 合并 resize 时丢失前面的尺寸约束。
+  const packed = await image.png().toBuffer();
+  let output = await sharp(packed).resize({ width: limit, height: limit, fit: "inside" }).webp({ lossless: true }).toBuffer();
+  if (output.length > 512 * 1024) output = await sharp(output).webp({ quality: 85 }).toBuffer();
+  return output;
+}
+
 /** 语录中的媒体统一为本地预览，避免旧媒体接口绕过玻璃、全名和群标签处理。 */
 async function getQuoteMediaPreview(message: any): Promise<{ url: string } | undefined> {
   const media = message.media;
@@ -1214,6 +1238,7 @@ class YvluPlugin extends Plugin {
         }
         // 头像替换和异常恢复完成后裁掉外部透明空白，中间识别仍使用原来的坐标。
         buffer = await fitQuoteArtwork(buffer, quoteData.messages);
+        buffer = await prepareQuoteSticker(buffer);
       }
       return { buffer, ext: "webp" };
     } catch (error) {
