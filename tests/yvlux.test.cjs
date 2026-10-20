@@ -15,6 +15,7 @@ const compiled = ts.transpileModule(source, {
 assert.equal(compiled.diagnostics.length, 0, 'TypeScript syntax');
 let requests = [], sent = [], history = [], responseData, fetchOptions=[], realisticQuote=false;
 let liveQuote=false, liveSerial=0, quoteInputs=[];
+let omitMessage=false, omitAvatars=false, joinBubbles=false;
 const classes = new Map();
 const Api = new Proxy({}, {get(_, key) {
   if (key === 'channels' || key === 'messages' || key === 'stickers') {
@@ -44,23 +45,27 @@ const axios = async options => {
     const rects=rows.map((row,index)=>`<rect x="100" y="${10+index*110}" width="20" height="30" fill="white"/><rect x="140" y="${10+index*110}" width="${Math.max(16,Math.min(480,[...row.from.name].length*20))}" height="30" fill="white"/>`).join('');
     return {data:await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="${rows.length*110+30}">${rects}</svg>`)).png().toBuffer(),status:200};
   }
-  if (realisticQuote) {
-    let y=10;const parts=[];const rows=options.data.messages;
+  if (realisticQuote || options.data.messages.length) {
+    let y=10;const parts=[];const rows=omitMessage&&options.data.messages.length>1?options.data.messages.filter((_,index)=>index!==1):options.data.messages;
     rows.forEach((row,index)=>{
-      const h=row.replyMessage?115:64,w=row.text.length<5?65:260;
+      const h=row.replyMessage?115:64,w=(row.text||'').length<5?65:260;
       parts.push(`<rect x="80" y="${y}" width="${w}" height="${h}" rx="13" fill="#302737"/><rect x="96" y="${y+15}" width="10" height="15" fill="white"/>`);
       if(row.replyMessage?.media?.kind==='story')parts.push(`<circle cx="128" cy="${y+44}" r="20" fill="#ff77bb"/>`);
-      if(index===rows.length-1||row.from.id!==rows[index+1].from.id)parts.push(`<circle cx="25" cy="${y+h-25}" r="25" fill="#77bbff"/>`);
+      if((index===rows.length-1||row.from.id!==rows[index+1].from.id)&&!(omitAvatars&&rows.length>1))parts.push(`<circle cx="25" cy="${y+h-25}" r="25" fill="#77bbff"/>`);
+      if(joinBubbles&&rows.length>1&&index<rows.length-1)parts.push(`<rect x="100" y="${y+h-1}" width="20" height="10" fill="#302737"/>`);
       y+=h+8;
     });
-    return {data:await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="512" height="${y+10}">${parts.join('')}</svg>`)).webp({lossless:true}).toBuffer(),status:200};
+    const native=options.data.type==='png'&&options.data.style==='glass';
+    let fixture=sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="512" height="${y+10}">${parts.join('')}</svg>`));
+    if(native)fixture=fixture.resize(1024,(y+10)*2);
+    return {data:native?await fixture.png().toBuffer():await fixture.webp({lossless:true}).toBuffer(),status:200};
   }
   return {data: responseData, status: 200};
 };
 axios.isAxiosError = () => false;
 const client = {
   getMessages: async (_,options) => {fetchOptions.push(options);return history;},
-  downloadProfilePhoto: async () => Buffer.from('synthetic-avatar'),
+  downloadProfilePhoto: async () => sharp({create:{width:20,height:20,channels:4,background:'#5588bb'}}).png().toBuffer(),
   sendFile: async (_, options) => { sent.push({...options, bytes: fs.readFileSync(options.file)}); },
 };
 const exportsObj = {};
@@ -75,7 +80,7 @@ const mockRequire = name => {
   if (name === '@utils/tlRevive') return {reviveEntities: e => e};
   return require(name);
 };
-vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;', {
+vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;', {
   require: mockRequire, exports: exportsObj, Buffer, console: {log() {}, warn() {}, error() {}},
 });
 const plugin = exportsObj.default;
@@ -125,17 +130,17 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(req.data.messages[0].text, '自定义语录');
   req = await run('.yvlux r', [{...message(10, '回复内容'), isReply:true, getReplyMessage: async () => message(9, '引用原文')}]);
   assert.equal(req.data.messages[0].replyMessage.text, '引用原文');
-  const payload = {messages: [{from: {id:7}, media: {url: 'data:image/png;base64,AA=='}}]};
+  const mediaFixture=await sharp({create:{width:50,height:30,channels:4,background:'#5588bb'}}).png().toBuffer();
+  const payload = {messages: [{from: {id:7}, media: {url: 'data:image/png;base64,'+mediaFixture.toString('base64')}}]};
   requests = [];
   await plugin.generateQuote(payload);
   assert.equal(requests[0].url, 'https://quote.yuri.ly/generate.webp');
   assert.equal(requests[0].data.messages[0].media,undefined,'local photos must not switch to legacy API or be sent as unsupported data URLs');
-  payload.messages[0].media.url = 'data:image/jpeg;base64,AA==';
+  payload.messages[0].media.url = 'data:image/png;base64,'+mediaFixture.toString('base64');
   requests = [];
   await plugin.generateQuote(payload);
   assert.equal(requests[0].url, 'https://quote.yuri.ly/generate.webp', 'photo quote retains glass backend');
-  const animatedWebp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBPANIM'), Buffer.alloc(10)]);
-  payload.messages[0].media.url = 'data:image/webp;base64,' + animatedWebp.toString('base64');
+  payload.messages[0].media.url = 'data:image/png;base64,'+mediaFixture.toString('base64');
   requests = [];
   await plugin.generateQuote(payload);
   assert.equal(requests[0].url, 'https://quote.yuri.ly/generate.webp');
@@ -258,6 +263,44 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   await plugin.cmdHandlers.yvlux({id:200,peerId:1,message:'.yvlux 12',getReplyMessage:async()=>sameAuthor[0],edit:async options=>{failureText=options.text;},delete:async()=>{revoked=true;}});
   client.sendFile=normalSend;
   assert.equal(sent.length,1);assert.equal(revoked,false);assert.match(failureText,/第 2 张发送失败（已发送 1 张）/);assert.equal(fs.existsSync(failedPath),false,'failed upload temporary file is cleaned up');
+  // 本次报错的根因：空消息被跳过、纯表情改成裸贴纸、布局数量与消息不一致。
+  const emojiMessages=[message(10,'👍'),message(12,'😂😂'),message(14,'')];
+  const emojiRequest=await run('.yvlux 3',emojiMessages);
+  assert.equal(emojiRequest.data.messages[0].text,'👍\u200b');assert.equal(emojiRequest.data.messages[1].text,'😂😂\u200b');
+  assert.equal(emojiRequest.data.messages[2].text,'[无文字消息]');assert.equal(emojiMessages[0].message,'👍','normalization only affects backend payload');
+  for(const emoji of ['🇨🇳','👨‍👩‍👧‍👦','1️⃣','❤️','🏳️‍🌈','👍🏽'])assert.equal(exportsObj._body({text:emoji}),emoji+'\u200b',`normal bubble for ${emoji}`);
+  for(const text of ['123','普通文字','👍 好'])assert.equal(exportsObj._body({text}),text);
+  requests=[];omitMessage=true;
+  const fallbackPayload={type:'quote',format:'webp',style:'glass',backgroundColor:'#302737/#221d2a',width:512,height:768,scale:2,messages:[
+    {avatar:true,from:{id:991,first_name:'Author A',photo:{url:'data:image/png;base64,'+mediaFixture.toString('base64')}},senderTag:'标签 A',text:'甲'},
+    {avatar:false,from:{id:991},text:'乙'},
+    {avatar:true,from:{id:992,first_name:'Author B'},senderTag:'标签 B',text:'丙'},
+  ]};
+  const fallback=await plugin.generateQuote(fallbackPayload);
+  omitMessage=false;
+  const individual=requests.filter(request=>request.data.type==='png'&&request.data.style==='glass');
+  assert.equal(individual.length,3,'mismatched backend layout is retried per message, never assigned by guessed pixel order');
+  assert.ok(individual.every(request=>request.data.messages.length===1&&request.data.messages[0].avatar),'each retry has a single known message and layout');
+  assert.equal(individual[1].data.messages[0].from.first_name,'Author A','continuation restores complete sender metadata');
+  const fallbackPixels=await sharp(fallback.buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+  assert.equal(Math.max(fallbackPixels.info.width,fallbackPixels.info.height),512);
+  let avatarBands=0,avatarInBand=false;
+  for(let y=0;y<fallbackPixels.info.height;y++) {
+    const alpha=fallbackPixels.data[(y*fallbackPixels.info.width+15)*4+3];
+    if(alpha>=128&&!avatarInBand)avatarBands++;
+    avatarInBand=alpha>=128;
+  }
+  assert.equal(avatarBands,2,'one avatar at the end of each sender group after fallback composition');
+  for(const fault of ['missing-avatar','joined-bubbles']) {
+    requests=[];omitAvatars=fault==='missing-avatar';joinBubbles=fault==='joined-bubbles';
+    const recovered=await plugin.generateQuote(fallbackPayload);
+    omitAvatars=false;joinBubbles=false;
+    assert.equal(requests.filter(request=>request.data.type==='png'&&request.data.style==='glass').length,3,`${fault} also takes the structured retry`);
+    const recoveredMeta=await sharp(recovered.buffer).metadata();
+    assert.equal(Math.max(recoveredMeta.width,recoveredMeta.height),512);
+  }
+  console.log('PASS: pure emoji/empty-message normalization; incomplete backend layout retries preserve every message, header/tag alignment, uniform scale, and grouped avatars.');
+  if(process.argv.includes('--layout-only'))return;
   // 所有有效选择器 × r/n/t 子集，分别覆盖文本、图片、贴纸及动画缩略图。
   // --live 只针对合成测试图片访问默认绘图接口，Telegram 始终是模拟客户端。
   const live=process.argv.includes('--live');

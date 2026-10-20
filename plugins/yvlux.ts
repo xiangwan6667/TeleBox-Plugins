@@ -505,6 +505,22 @@ const QUOTE_APPEARANCE = {
   backgroundColor: "#302737/#221d2a",
 };
 
+function quoteBodyText(message: any): string {
+  let text = typeof message.text === "string" ? message.text : String(message.text || "");
+  if (!text.trim()) {
+    // 无文字媒体仍须保留一个基础气泡，不能让接口跳过此条、导致后续姓名错位。
+    text = message.media ? "\u200b" : message.replyMessage ? "\u200b" : "[无文字消息]";
+  }
+  // 后端会将 1–3 个纯表情改成无气泡的大贴纸。末尾加不可见字符保留普通气泡；
+  // 只追加后缀，不改变正文或任何实体的 UTF-16 偏移。
+  if (/^[\p{Emoji}\p{Emoji_Component}\s]+$/u.test(text) && /\p{Emoji_Presentation}|\p{Extended_Pictographic}|\u20e3/u.test(text)) text += "\u200b";
+  return text;
+}
+
+class QuoteLayoutError extends Error {
+  constructor(details: string) { super(details); this.name = "QuoteLayoutError"; }
+}
+
 async function getQuoteSenderTag(message: any, sender: any, client: any, cache: Map<string, Promise<any>>) {
   // 转发消息使用原作者，不能把转发者在当前群的标签贴到原作者身上。
   if (message.fwdFrom || !sender?.id || message.fromId instanceof Api.PeerChannel) return {};
@@ -659,7 +675,7 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
 }
 
 /** 扩大气泡内边距，复用原文字图层和 glass 高光参数。 */
-async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[] = [], messages: any[] = []): Promise<Buffer> {
+async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[] = [], messages: any[] = [], normalize = true): Promise<Buffer> {
   const sharp = (await import("sharp")).default;
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = info;
@@ -683,14 +699,20 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     parts.push({ left, right, top, bottom, pixels });
   }
   const avatars = parts.filter(p => p.left === 0 && p.right >= 7 && Math.abs(p.right + 1 - (p.bottom - p.top + 1)) <= 3);
-  if (!avatars.length) return buffer;
+  if (!avatars.length) {
+    if (messages.length) throw new QuoteLayoutError("未识别到头像布局");
+    return buffer;
+  }
   const scale = (avatars[0].right + 1) / 50;
   const bubbles = parts.filter(p => p.left >= 44 * scale && p.right - p.left + 1 >= 32 * scale && p.pixels.length > (p.right - p.left + 1) * (p.bottom - p.top + 1) * 0.65)
     .sort((a, b) => a.top - b.top);
-  if (!bubbles.length) return buffer;
+  if (!bubbles.length) {
+    if (messages.length) throw new QuoteLayoutError("未识别到消息气泡");
+    return buffer;
+  }
   // 按参考图保持紧凑比例：原内边距 16px → 18px，不缩放字形。
   const extra = Math.max(1, Math.round(2 * scale));
-  if (headers.length && bubbles.length !== headers.length) throw new Error("昵称与气泡布局不一致，请稍后重试");
+  if (headers.length && bubbles.length !== headers.length) throw new QuoteLayoutError(`消息气泡数量不匹配：${bubbles.length}/${headers.length}`);
   const renderedHeaders = await Promise.all(bubbles.map(async (_, index) => {
     if (!headers[index]) return undefined;
     const meta = await sharp(headers[index]).metadata();
@@ -734,7 +756,9 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     const probe = Math.max(1, Math.round(3 * scale));
     const round = (x: number, y: number) => data[(y * width + x) * 4 + 3] >= 128 ? grouped : radius;
     const radii = [round(bodyLeft + probe, bubble.top + probe), round(bubble.right - probe, bubble.top + probe), round(bubble.right - probe, bubble.bottom - probe), round(bodyLeft + probe, bubble.bottom - probe)];
-    const tail = bubble.left < bodyLeft - scale ? 14 * scale : 0;
+    const group = messages[index]?._quoteGroup;
+    if (group) { radii[0] = group.previousSame ? grouped : radius; radii[3] = group.nextSame ? grouped : radius; }
+    const tail = (!group || !group.nextSame) && bubble.left < bodyLeft - scale ? 14 * scale : 0;
     const [rTL, rTR, rBR] = radii;
     // 尾巴附近的 alpha 本来就是实心，不能把它误判为分组的小圆角。
     const rBL = tail ? radius : radii[3];
@@ -758,7 +782,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     // 光学内边距按可见字形计量；底部多保留一段，以免裁掉字母下伸部。
     const side = Math.round(16 * scale), above = Math.round(12 * scale), below = Math.round(8 * scale);
     const content = { left: bodyLeft + side, top: bubble.top + above, width: oldW - side * 2, height: oldH - above - below };
-    if (content.width <= 0 || content.height <= 0) return buffer;
+    if (content.width <= 0 || content.height <= 0) throw new QuoteLayoutError("消息内容区域不完整");
     layers.push({ input: await sharp(buffer).extract(content).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra + headerHeight });
     if (header) layers.push({ input: header.buffer, left: bodyLeft + Math.round(18 * scale), top: bubble.top + offsetY + Math.round(18 * scale) });
     const addImage = async (source: Buffer, left: number, top: number, imageW: number, imageH: number, radius: number) => {
@@ -820,9 +844,10 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     if (output[(y * outWidth + x) * 4 + 3]) { right = Math.max(right, x); bottom = Math.max(bottom, y); }
   }
   // 优先利用原贴纸的透明区域；超出 Telegram 尺寸时再整体缩小。
-  return sharp(output, { raw: { width: outWidth, height: outHeight, channels: 4 } })
-    .extract({ left: 0, top: 0, width: Math.max(width, right + 1), height: Math.max(height, bottom + 1) })
-    .resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
+  const image = sharp(output, { raw: { width: outWidth, height: outHeight, channels: 4 } })
+    .extract({ left: 0, top: 0, width: Math.max(width, right + 1), height: Math.max(height, bottom + 1) });
+  if (!normalize) return image.png().toBuffer();
+  return image.resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
 }
 
 /** 新版 API 只接受远程头像 URL；用本地已下载的头像替换它绘制的圆形占位头像。 */
@@ -1003,6 +1028,65 @@ class YvluPlugin extends Plugin {
    * 知识点：调用后端 quote-api 核心函数
    * 发送组装好的 JSON 给远端，要求返回 arraybuffer 流 (贴纸图片或动图)
    */
+  private async renderQuoteRows(quoteData: any, data: any, headers: (Buffer | undefined)[]): Promise<Buffer> {
+    const sharp = (await import("sharp")).default;
+    const scale = 2, shadowPad = 4 * scale;
+    const messages = quoteData.messages;
+    const profiles: any[] = [];
+    let profile: any;
+    for (const message of messages) {
+      if (!profile || profile.id !== message.from.id || message.avatar) profile = message.from;
+      profiles.push({ ...profile, ...message.from, photo: message.from.photo || profile.photo });
+    }
+    const rows: any[] = new Array(messages.length);
+    let next = 0;
+    const render = async () => {
+      while (next < messages.length) {
+        const index = next++, message = messages[index];
+        const previousSame = index > 0 && messages[index - 1].from.id === message.from.id;
+        const nextSame = index + 1 < messages.length && messages[index + 1].from.id === message.from.id;
+        const response = await axios({
+          method: "post", url: DEFAULT_API_URL, timeout, responseType: "arraybuffer",
+          headers: { "Content-Type": "application/json", "User-Agent": "TeleBox/0.2.1" },
+          // 原生 PNG 保留统一字号；不能逐条先缩到 512，再以不同倍率拼接。
+          data: { ...data, type: "png", format: "png", scale, messages: [{ ...data.messages[index], avatar: true }] },
+        });
+        const local = { ...message, avatar: true, from: profiles[index], _quoteGroup: { previousSame, nextSame } };
+        let buffer = await expandGlassPadding(Buffer.from(response.data), [headers[index]], [local], false);
+        if (nextSame) {
+          const meta = await sharp(buffer).metadata();
+          buffer = await sharp(buffer).composite([{ input: Buffer.from(`<svg width="${meta.width}" height="${meta.height}"><rect width="${50 * scale}" height="${meta.height}" fill="white"/></svg>`), blend: "dest-out" }]).png().toBuffer();
+        } else buffer = await restoreGlassAvatars(buffer, [local]);
+        const { data: pixels, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        let top = info.height, bottom = -1;
+        for (let y = 0; y < info.height; y++) for (let x = 0; x < info.width; x++) {
+          if (pixels[(y * info.width + x) * 4 + 3] >= 128) { top = Math.min(top, y); bottom = y; break; }
+        }
+        if (bottom < top) throw new Error(`第 ${index + 1} 条消息渲染为空`);
+        const cropTop = Math.max(0, top - shadowPad), cropBottom = Math.min(info.height, bottom + shadowPad + 1);
+        rows[index] = {
+          buffer: await sharp(buffer).extract({ left: 0, top: cropTop, width: info.width, height: cropBottom - cropTop }).png().toBuffer(),
+          width: info.width, height: cropBottom - cropTop, topPad: top - cropTop, bottomPad: cropBottom - bottom - 1,
+        };
+      }
+    };
+    // 最多两个逐条请求同时处理，避免大图一起解码占用过多内存。
+    await Promise.all(Array.from({ length: Math.min(2, messages.length) }, () => render()));
+    const layers: any[] = [];
+    let height = 0;
+    for (const [index, row] of rows.entries()) {
+      if (index) {
+        const same = messages[index - 1].from.id === messages[index].from.id;
+        height += (same ? 8 : 14) * scale - rows[index - 1].bottomPad - row.topPad;
+      }
+      layers.push({ input: row.buffer, left: 0, top: height });
+      height += row.height;
+    }
+    const combined = await sharp({ create: { width: Math.max(394 * scale, ...rows.map(row => row.width)), height, channels: 4, background: "#00000000" } })
+      .composite(layers).png().toBuffer();
+    return sharp(combined).resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
+  }
+
   async generateQuote(quoteData: any): Promise<{ buffer: Buffer; ext: string }> {
     try {
       let url = this.config?.apiUrl;
@@ -1025,7 +1109,7 @@ class YvluPlugin extends Plugin {
             const localContent = {
               ...message, senderTag: undefined, senderTagRole: undefined, media: undefined,
               // 即使图片没有配文也保留一个可识别的基础气泡，实际图片稍后本地合成。
-              text: message.text || (message.media ? "\u200b" : ""),
+              text: quoteBodyText(message),
               replyMessage: message.replyMessage ? {
                 ...message.replyMessage,
                 media: message.replyMessage.media?.url?.startsWith("data:image/") ? { kind: "story" } : undefined,
@@ -1071,8 +1155,14 @@ class YvluPlugin extends Plugin {
         buffer = await sharp(buffer).resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
       }
       if (url === DEFAULT_API_URL) {
-        buffer = await expandGlassPadding(buffer, headers, quoteData.messages);
-        buffer = await restoreGlassAvatars(buffer, quoteData.messages);
+        try {
+          buffer = await expandGlassPadding(buffer, headers, quoteData.messages);
+          buffer = await restoreGlassAvatars(buffer, quoteData.messages);
+        } catch (error) {
+          if (!(error instanceof QuoteLayoutError) || quoteData.messages.length < 2) throw error;
+          console.warn(`[yvlux] 整图布局异常，改为逐条渲染后合成: ${error.message}`);
+          buffer = await this.renderQuoteRows(quoteData, data, headers);
+        }
       }
       return { buffer, ext: "webp" };
     } catch (error) {
