@@ -182,6 +182,20 @@ const sanitizeOptimizedImagePrompt = (text: string, fallback: string): string =>
   return compact || fallback;
 };
 
+const parseOptimizedImagePrompts = (text: string, count: number): string[] | null => {
+  try {
+    const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+    const parsed: unknown = JSON.parse(cleaned);
+    if (!Array.isArray(parsed) || parsed.length !== count) return null;
+    if (parsed.some((item) => typeof item !== "string" || !item.trim())) return null;
+    const prompts = parsed.map((item: string) => sanitizeOptimizedImagePrompt(item, ""));
+    if (prompts.some((item) => !item) || new Set(prompts.map((item) => item.replace(/\s+/g, ""))).size !== count) return null;
+    return prompts;
+  } catch {
+    return null;
+  }
+};
+
 const buildPromptOptimizationStatusText = (prompt: string): string =>
   `🧠 <b>正在优化生图提示词...</b>\n\n` +
   `<b>📝 原始 Prompt</b>\n` +
@@ -222,7 +236,7 @@ const runPromptOptimizationWithTimeout = async (
     if (!token.aborted) token.abort("请求超时");
   }, timeoutMs);
   try {
-    return await aiService.callAI(request, imageParts, token);
+    return await runAbortable(() => aiService.callAI(request, imageParts, token), token);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -935,11 +949,13 @@ const resolveMergedImageParts = async (
 const collectImagePartsFromSingleMessage = async (
   msg: Api.Message,
   out: AIContentPart[],
+  token?: AbortToken,
 ): Promise<void> => {
+  token?.throwIfAborted();
   if (!msg.media || !msg.client) return;
 
   if (msg.media instanceof Api.MessageMediaPhoto) {
-    const downloaded = await msg.client.downloadMedia(msg);
+    const downloaded = await runAbortable(() => msg.client!.downloadMedia(msg), token);
     const buffer = await normalizeDownloadedMedia(downloaded);
     if (!buffer) return;
     const dataUrl = `data:image/jpeg;base64,${buffer.toString("base64")}`;
@@ -965,7 +981,7 @@ const collectImagePartsFromSingleMessage = async (
     const thumb = getDocumentThumb(doc);
 
     if (!isAnimated && docMime.startsWith("image/")) {
-      const downloaded = await msg.client.downloadMedia(msg);
+      const downloaded = await runAbortable(() => msg.client!.downloadMedia(msg), token);
       const buffer = await normalizeDownloadedMedia(downloaded);
       if (!buffer) return;
       const dataUrl = `data:${docMime};base64,${buffer.toString("base64")}`;
@@ -976,7 +992,7 @@ const collectImagePartsFromSingleMessage = async (
     let frameBuffer: Buffer | null = null;
 
     if (thumb) {
-      const downloaded = await msg.client.downloadMedia(msg, { thumb });
+      const downloaded = await runAbortable(() => msg.client!.downloadMedia(msg, { thumb }), token);
       const buffer = await normalizeDownloadedMedia(downloaded);
       if (buffer) {
         try {
@@ -988,7 +1004,7 @@ const collectImagePartsFromSingleMessage = async (
     }
 
     if (!frameBuffer) {
-      const downloaded = await msg.client.downloadMedia(msg);
+      const downloaded = await runAbortable(() => msg.client!.downloadMedia(msg), token);
       const buffer = await normalizeDownloadedMedia(downloaded);
       if (buffer) {
         try {
@@ -1006,52 +1022,77 @@ const collectImagePartsFromSingleMessage = async (
   }
 };
 
+const getAlbumMessages = async (
+  msg: Api.Message,
+  token?: AbortToken,
+): Promise<Api.Message[]> => {
+  const messages = new Map<number, Api.Message>([[Number(msg.id), msg]]);
+  const groupedId = (msg as any).groupedId?.toString();
+  if (!groupedId || !msg.client) return [msg];
+  const client = msg.client;
+  try {
+    await runAbortable(async () => {
+      // Anchor the history window to the album, including messages on either side.
+      for await (const item of client.iterMessages(msg.chatId || msg.peerId, {
+        offsetId: Number(msg.id) + 1, addOffset: -10, limit: 30,
+      })) {
+        token?.throwIfAborted();
+        if (item instanceof Api.Message && (item as any).groupedId?.toString() === groupedId) {
+          messages.set(Number(item.id), item);
+        }
+      }
+    }, token, 12000);
+  } catch (error) {
+    if (token?.aborted) throw error;
+    // The replied-to image is still usable if its album cannot be fetched.
+  }
+  return [...messages.values()].sort((a, b) => Number(a.id) - Number(b.id));
+};
+
 const getMessageImageParts = async (
   msg?: Api.Message,
+  token?: AbortToken,
 ): Promise<AIContentPart[]> => {
   if (!msg?.client) return [];
 
   const parts: AIContentPart[] = [];
 
-  const rawGroupedId = (msg as any).groupedId;
-  const groupedId = rawGroupedId ? rawGroupedId.toString() : undefined;
-
-  if (!groupedId) {
-    await collectImagePartsFromSingleMessage(msg, parts);
-    return parts;
-  }
-
-  const peer = msg.chatId || msg.peerId;
-  const sameGroupMessages: Api.Message[] = [];
-
-  for await (const m of msg.client.iterMessages(peer, { limit: 50, offsetDate: 0 })) {
-    if (!(m instanceof Api.Message)) continue;
-
-    const g = (m as any).groupedId;
-    if (!g) continue;
-
-    if (g.toString() !== groupedId) continue;
-
-    sameGroupMessages.push(m);
-  }
-
-  sameGroupMessages.sort((a, b) => Number(a.id) - Number(b.id));
-
-  for (const m of sameGroupMessages) {
-    await collectImagePartsFromSingleMessage(m, parts);
+  for (const m of await getAlbumMessages(msg, token)) {
+    await collectImagePartsFromSingleMessage(m, parts, token);
   }
 
   return parts;
 };
 
-const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T | null> => {
-  return Promise.race([
-    promise,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
-  ]);
+const runAbortable = async <T>(
+  operation: () => Promise<T>,
+  token?: AbortToken,
+  timeoutMs = 0,
+): Promise<T> => {
+  token?.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      token?.signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new UserError(token?.reason || "操作已取消"));
+    };
+    token?.signal.addEventListener("abort", onAbort, { once: true });
+    if (timeoutMs > 0) timer = setTimeout(() => {
+      cleanup();
+      reject(new UserError("素材读取超时"));
+    }, timeoutMs);
+    Promise.resolve().then(() => {
+      token?.throwIfAborted();
+      return operation();
+    }).then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+  });
 };
 
-const downloadAvatarBufferCompat = async (msg?: Api.Message): Promise<Buffer | null> => {
+const downloadAvatarBufferCompat = async (msg?: Api.Message, token?: AbortToken): Promise<Buffer | null> => {
   if (!msg?.client) return null;
   const client = msg.client;
   const candidates: any[] = [];
@@ -1065,20 +1106,25 @@ const downloadAvatarBufferCompat = async (msg?: Api.Message): Promise<Buffer | n
   pushCandidate((msg as any).senderId);
   pushCandidate(msg.fromId);
   try {
-    const sender = await msg.getSender?.();
+    const sender = await runAbortable(() => Promise.resolve(msg.getSender?.()), token, 12000);
     pushCandidate(sender?.id);
     pushCandidate(sender);
-  } catch {}
+  } catch (error) {
+    if (token?.aborted) throw error;
+  }
 
   for (const candidate of candidates) {
     for (const isBig of [true, false]) {
       try {
-        const photoBuf = await withTimeout(
-          client.downloadProfilePhoto(candidate, { isBig }),
+        const photoBuf = await runAbortable(
+          () => client.downloadProfilePhoto(candidate, { isBig }),
+          token,
           12000,
         );
         if (Buffer.isBuffer(photoBuf) && photoBuf.length > 0) return photoBuf;
-      } catch {}
+      } catch (error) {
+        if (token?.aborted) throw error;
+      }
     }
   }
   return null;
@@ -1086,8 +1132,9 @@ const downloadAvatarBufferCompat = async (msg?: Api.Message): Promise<Buffer | n
 
 const getAvatarImagePartFromMessageSender = async (
   msg?: Api.Message,
+  token?: AbortToken,
 ): Promise<AIContentPart | null> => {
-  const photoBuf = await downloadAvatarBufferCompat(msg);
+  const photoBuf = await downloadAvatarBufferCompat(msg, token);
   if (!photoBuf) return null;
   return {
     type: "image_url",
@@ -1101,20 +1148,7 @@ const getGroupedMessageIds = async (msg: Api.Message): Promise<number[]> => {
   const groupedId = rawGroupedId ? rawGroupedId.toString() : undefined;
   if (!groupedId) return [];
 
-  const peer = msg.chatId || msg.peerId;
-  const ids: number[] = [];
-
-  for await (const m of msg.client.iterMessages(peer, { limit: 50, offsetDate: 0 })) {
-    if (!(m instanceof Api.Message)) continue;
-    const g = (m as any).groupedId;
-    if (!g) continue;
-    if (g.toString() !== groupedId) continue;
-    ids.push(Number(m.id));
-  }
-
-  if (!ids.includes(Number(msg.id))) ids.push(Number(msg.id));
-
-  return Array.from(new Set(ids)).sort((a, b) => a - b);
+  return (await getAlbumMessages(msg)).map((item) => Number(item.id));
 };
 
 const deleteMessageOrGroup = async (msg: Api.Message): Promise<void> => {
@@ -5408,12 +5442,6 @@ class ImageFeature extends BaseFeatureHandler {
     return { prompt: kept.join(" ").trim(), count: Math.max(1, count || 1) };
   }
 
-  private async getReplyAvatarImagePart(replyMsg?: Api.Message): Promise<AIContentPart | null> {
-    const photoBuf = await downloadAvatarBufferCompat(replyMsg);
-    if (!photoBuf) return null;
-    return { type: "image_url", image_url: { url: `data:image/jpeg;base64,${photoBuf.toString("base64")}` } };
-  }
-
   async execute(
     msg: Api.Message,
     args: string[],
@@ -5422,9 +5450,6 @@ class ImageFeature extends BaseFeatureHandler {
     const prefixes = getPrefixes();
     const configManager = await this.getConfigManager();
     const config = configManager.getConfig();
-    const replyMsg = await safeGetReplyMessage(msg);
-    const replyToId = replyMsg?.id;
-
     const subCommand = args[1]?.toLowerCase();
 
     // 图片提示词优化总开关：.aix image optimize on/off
@@ -5471,12 +5496,10 @@ class ImageFeature extends BaseFeatureHandler {
 
     const avatarLock = this.consumeAvatarLockArg(args);
     args = avatarLock.args;
-    const forceAvatar = avatarLock.forceAvatar;
-    const sourceLock = this.detectSourceLock(args, forceAvatar);
+    const sourceLock = this.detectSourceLock(args, avatarLock.forceAvatar);
     const imageRequest = this.parseImageRequest(args);
     const optimizeParsed = extractPromptOptimizeFlag(imageRequest.prompt);
-    const promptInput = optimizeParsed.prompt;
-    const cleanedPromptInput = promptInput.replace(/\s+/g, " ").trim();
+    const originalPrompt = optimizeParsed.prompt.trim();
     const optimizePrompt = optimizeParsed.optimizePrompt || config.promptOptimize !== false;
     const imageCount = imageRequest.count;
     const wantsAvatar = sourceLock === "avatar";
@@ -5485,324 +5508,175 @@ class ImageFeature extends BaseFeatureHandler {
       ? `${value}\n\n参考图顺序：第一张（IMAGE A）是被回复者的头像，第二张（IMAGE B）是发送这条生图命令的人的头像。请同时参考这两个头像，保留各自的核心外观特征，按用户要求生成画面，不要混淆或遗漏其中一方。`
       : value;
 
-    requireUser(!wantsDualAvatars || !!replyMsg, "双头像模式需要回复一条消息，例如 .aix image aa 两个人一起喝茶");
-    
-    let replyImageParts = wantsDualAvatars ? [] : await getMessageImageParts(replyMsg);
-    const messageImageParts = await getMessageImageParts(msg);
-    let imageParts = [...replyImageParts, ...messageImageParts];
-    const originalReplyImageParts = [...replyImageParts];
-    const originalImageParts = [...imageParts];
-
-
-    if (wantsDualAvatars) {
-      const [replyAvatar, senderAvatar] = await Promise.all([
-        getAvatarImagePartFromMessageSender(replyMsg),
-        getAvatarImagePartFromMessageSender(msg),
-      ]);
-      requireUser(!!replyAvatar, "无法获取被回复者的头像，请确认对方有可访问的头像");
-      requireUser(!!senderAvatar, "无法获取命令发送者的头像，请确认发送者有可访问的头像");
-      imageParts = [replyAvatar!, senderAvatar!, ...messageImageParts];
-    } else if (sourceLock === "avatar") {
-      imageParts = [];
-      replyImageParts = [];
-      const avatarPart = await this.getReplyAvatarImagePart(replyMsg);
-      if (avatarPart) imageParts = [avatarPart, ...messageImageParts];
-    } else if (sourceLock === "sticker") {
-      imageParts = [...replyImageParts.filter((part, idx) => idx < replyImageParts.length), ...messageImageParts];
-    } else if (sourceLock === "image") {
-      imageParts = [...replyImageParts, ...messageImageParts];
-    }
-
-    // 🆕 明确说“头像”时，优先取被回复用户头像，避免回复贴纸时误重绘贴纸
-    if (wantsAvatar) {
-      imageParts = [];
-      replyImageParts = [];
-      let avatarLoaded = false;
-      const avatarPart = await this.getReplyAvatarImagePart(replyMsg);
-      if (avatarPart) {
-        imageParts = [avatarPart, ...messageImageParts];
-        avatarLoaded = true;
-      }
-      if (!avatarLoaded) {
-        // 头像取不到时，不要直接中断；如果用户回复的是图片/贴纸，就退回到图片/贴纸重绘
-        replyImageParts = originalReplyImageParts;
-        imageParts = originalImageParts;
-        if (imageParts.length === 0) {
-          throw new UserError("无法获取被回复用户的头像，请确认对方有公开头像，或直接回复图片/贴纸重绘");
-        }
-      }
-    }
-
-    requireUser(imageParts.length <= 6, "⚠️ 最多支持6张参考图");
-
-    const hasPrompt = !!cleanedPromptInput;
-    requireUser(hasPrompt, "至少需要一条文字提示");
-
-    if (
-      !config.currentImageTag ||
-      !config.currentImageModel ||
-      !config.configs[config.currentImageTag]
-    ) {
-      throw new UserError(
-        `请先配置 API 并设置模型\n使用 ${prefixes[0]}aix config add <tag> <url> <key> [type] 和 ${prefixes[0]}aix model image <tag> <model-path>`,
-      );
-    }
+    requireUser(!!originalPrompt, "至少需要一条文字提示");
+    requireUser(Number.isSafeInteger(imageCount) && imageCount > 0, "图片数量必须是有效的正整数");
+    requireUser(
+      !!config.currentImageTag && !!config.currentImageModel && !!config.configs[config.currentImageTag],
+      `请先配置 API 并设置模型\n使用 ${prefixes[0]}aix config add <tag> <url> <key> [type] 和 ${prefixes[0]}aix model image <tag> <model-path>`,
+    );
+    if (optimizePrompt) requireUser(
+      !!config.currentChatTag && !!config.currentChatModel && !!config.configs[config.currentChatTag],
+      "⚠️ 图片提示词优化已开启，请先配置聊天模型",
+    );
 
     const token = this.aiService.createAbortToken();
-    let imageGenerationDone = false;
-    let generationStatusMsg: Api.Message | undefined;
+    const timeoutMs = Math.max(config.timeout || 30, 1) * 1000;
+    let preparationTimeoutId: ReturnType<typeof setTimeout> | undefined;
     let imagePhaseTimeoutId: ReturnType<typeof setTimeout> | undefined;
-
+    let generationStatusMsg: Api.Message | undefined;
+    let deliveryToken = token;
     try {
-      const referenceCount = Math.min(imageParts.length, 6);
-      if (referenceCount > 0) {
-        generationStatusMsg = await MessageSender.sendNew(
-          msg,
-          `🔍 正在识别第 1/${referenceCount} 张图片...`,
-        );
-        for (let i = 1; i < referenceCount; i++) {
-          token.throwIfAborted();
-          await sleep(350, token);
-          generationStatusMsg = await replaceStatusMessage(
-            generationStatusMsg,
-            msg,
-            `🔍 正在识别第 ${i + 1}/${referenceCount} 张图片...`,
-          );
-        }
-        generationStatusMsg = await replaceStatusMessage(
-          generationStatusMsg,
-          msg,
-          optimizePrompt
-            ? `✅ 已识别 ${referenceCount} 张图片，正在优化提示词...`
-            : `✅ 已识别 ${referenceCount} 张图片，正在结合生成...`,
-        );
-        if (messageImageParts.length > 0) {
-          await deleteMessageOrGroup(msg);
-        }
-        await sleep(800, token);
-      } else if (!optimizePrompt) {
-        generationStatusMsg = await MessageSender.sendOrEdit(msg, PROCESSING_TEXT.image, {
-          parseMode: "html",
-        });
-      }
-      let prompt = cleanedPromptInput;
-      const originalPrompt = prompt;
-      let optimizedPromptText = prompt;
-      let perImagePrompts: string[] = [];
+      preparationTimeoutId = setTimeout(() => token.abort("素材读取超时"), timeoutMs);
+      generationStatusMsg = await runAbortable(() => MessageSender.sendNew(msg, "📥 正在读取参考素材..."), token);
+      const replyMsg = await runAbortable(() => safeGetReplyMessage(msg), token);
+      const replyToId = replyMsg?.id;
+      requireUser(!wantsDualAvatars || !!replyMsg, "双头像模式需要回复一条消息，例如 .aix image aa 两个人一起喝茶");
 
+      const messageImageParts = await getMessageImageParts(msg, token);
+      let imageParts: AIContentPart[];
+      if (wantsDualAvatars) {
+        const [replyAvatar, senderAvatar] = await Promise.all([
+          getAvatarImagePartFromMessageSender(replyMsg, token),
+          getAvatarImagePartFromMessageSender(msg, token),
+        ]);
+        requireUser(!!replyAvatar, "无法获取被回复者的头像，请确认对方有可访问的头像");
+        requireUser(!!senderAvatar, "无法获取命令发送者的头像，请确认发送者有可访问的头像");
+        imageParts = [replyAvatar!, senderAvatar!, ...messageImageParts];
+      } else if (wantsAvatar) {
+        const avatar = await getAvatarImagePartFromMessageSender(replyMsg, token);
+        // Read reply media only if the avatar is unavailable, preserving the existing fallback.
+        imageParts = avatar
+          ? [avatar, ...messageImageParts]
+          : [...await getMessageImageParts(replyMsg, token), ...messageImageParts];
+        requireUser(imageParts.length > 0, "无法获取被回复用户的头像，请确认对方有公开头像，或直接回复图片/贴纸重绘");
+      } else {
+        imageParts = [...await getMessageImageParts(replyMsg, token), ...messageImageParts];
+      }
+      requireUser(imageParts.length <= 6, "⚠️ 最多支持6张参考图");
+
+      // Resolve/merge reference images once; every retry reuses exactly the same references.
+      let inputImage = imageParts.length > 0
+        ? await runAbortable(() => resolveMergedImageParts(imageParts, this.httpClient, token), token)
+        : null;
+      if (imageParts.length > 0) requireUser(!!inputImage?.data, "无法解析图片数据");
+      if (inputImage?.data && inputImage.mimeType !== "image/png") {
+        const data = inputImage.data;
+        inputImage = {
+          data: await runAbortable(() => sharp(data).png().toBuffer(), token),
+          mimeType: "image/png",
+        };
+      }
+      clearTimeout(preparationTimeoutId);
+      preparationTimeoutId = undefined;
+      token.throwIfAborted();
+
+      let perImagePrompts = Array.from({ length: imageCount }, (_, i) =>
+        normalizeSingleImagePrompt(originalPrompt, i, imageCount));
       if (optimizePrompt) {
-        requireUser(
-          !!config.currentChatTag && !!config.currentChatModel && !!config.configs[config.currentChatTag],
-          "⚠️ 图片提示词优化已开启，请先配置聊天模型",
-        );
         generationStatusMsg = await replaceStatusMessage(
-          generationStatusMsg,
-          msg,
-          buildPromptOptimizationStatusText(originalPrompt),
+          generationStatusMsg, msg, buildPromptOptimizationStatusText(originalPrompt),
         );
+        const request = buildImagePromptOptimizationRequest(
+          withAvatarReferences(originalPrompt), config.promptLength, config.imagePromptRules,
+        ) + (imageCount > 1
+          ? `\n\n本次需要 ${imageCount} 张独立图片。一次生成恰好 ${imageCount} 条提示词，每条对应一张图片，构图、动作、表情或画面文字必须有明显差异。最终只输出一个包含 ${imageCount} 个非空字符串的 JSON 数组，不要 Markdown、编号或其他说明。每条字符串各自遵守上述长度要求。`
+          : "");
+        const optimized = await runPromptOptimizationWithTimeout(
+          this.aiService, request, imageParts, token, timeoutMs,
+        );
+        let optimizationText: string;
         if (imageCount > 1) {
-          const optimizedPrompts: string[] = [];
-          for (let i = 0; i < imageCount; i++) {
-            token.throwIfAborted();
-            const explicitPrompt = normalizeSingleImagePrompt(originalPrompt, i, imageCount);
-            const basePrompt = `${explicitPrompt}\n\n第${i + 1}张必须和其他图片明显不同；如果是表情包加字，这一张必须直接写出自己专属的画面文字，不能和其他张重复。`;
-            const optimized = await runPromptOptimizationWithTimeout(
-              this.aiService,
-              buildImagePromptOptimizationRequest(withAvatarReferences(basePrompt), config.promptLength, config.imagePromptRules),
-              imageParts,
-              token,
-              Math.max((config.timeout || 30), 20) * 1000,
-            );
-            if (!optimized.text?.trim() || optimized.text.trim() === "AI 回复为空") {
-              optimized.text = originalPrompt;
-            }
-            optimizedPrompts.push(sanitizeOptimizedImagePrompt(optimized.text, basePrompt));
-            if (i < imageCount - 1) await sleep(1200, token);
+          const parsed = parseOptimizedImagePrompts(optimized.text || "", imageCount);
+          if (parsed) {
+            perImagePrompts = parsed.map((item, i) => normalizeSingleImagePrompt(item, i, imageCount));
+            optimizationText = buildMultiPromptStatusText("提示词已优化，正在生图...", parsed);
+          } else {
+            optimizationText = "⚠️ 优化结果数量、格式或差异不符合要求，已使用原提示词继续生图。";
           }
-          perImagePrompts = optimizedPrompts;
-          prompt = optimizedPrompts[0] || originalPrompt;
-          optimizedPromptText = optimizedPrompts.join("\n\n");
-          generationStatusMsg = await replaceStatusMessage(
-            generationStatusMsg,
-            msg,
-            buildMultiPromptStatusText("提示词已分别优化，正在生图...", optimizedPrompts),
-          );
-          await sleep(10000, token);
         } else {
-          const optimized = await runPromptOptimizationWithTimeout(
-            this.aiService,
-            buildImagePromptOptimizationRequest(withAvatarReferences(originalPrompt), config.promptLength, config.imagePromptRules),
-            imageParts,
-            token,
-            Math.max((config.timeout || 30), 20) * 1000,
-          );
-          if (!optimized.text?.trim() || optimized.text.trim() === "AI 回复为空") {
-            optimized.text = originalPrompt;
-          }
-          prompt = sanitizeOptimizedImagePrompt(optimized.text, originalPrompt);
-          optimizedPromptText = prompt;
-          perImagePrompts = [prompt];
-          generationStatusMsg = await replaceStatusMessage(
-            generationStatusMsg,
-            msg,
-            buildOptimizedPromptStatusText(prompt),
-          );
-          await sleep(10000, token);
+          const text = optimized.text?.trim();
+          const prompt = text && text !== "AI 回复为空"
+            ? sanitizeOptimizedImagePrompt(text, originalPrompt) : originalPrompt;
+          perImagePrompts = [normalizeSingleImagePrompt(prompt, 0, 1)];
+          optimizationText = buildOptimizedPromptStatusText(prompt);
         }
-        if (!imageGenerationDone) {
-          generationStatusMsg = await replaceStatusMessage(
-            generationStatusMsg,
-            msg,
-            PROCESSING_TEXT.image,
-          );
-        }
+        // Let the optimization result expire independently; generation starts immediately.
+        const optimizationMsg = await MessageSender.sendNew(msg, optimizationText, { parseMode: "html" });
+        scheduleDeleteMessage(optimizationMsg, 10000);
       }
+      generationStatusMsg = await replaceStatusMessage(generationStatusMsg, msg, PROCESSING_TEXT.image);
 
-      const normalizedPromptForImage = imageCount > 1
-        ? normalizeSingleImagePrompt(prompt, 0, imageCount)
-        : prompt;
-      const imageCaption = imageCount > 1
-        ? buildGeneratedPromptListText("优化后提示词", perImagePrompts.length > 0 ? perImagePrompts : Array.from({ length: imageCount }, (_, i) => normalizeSingleImagePrompt(prompt, i, imageCount)))
-        : (optimizedPromptText || normalizedPromptForImage);
-
-      // 整个生图阶段总超时：不是每次重试各等一次，避免“图片生成中”无限挂着。
-      imagePhaseTimeoutId = setTimeout(() => {
-        if (!token.aborted) {
-          token.abort("请求超时");
-        }
-      }, Math.max(config.timeout || 300, 20) * 1000);
-
-      let images: AIImage[] = [];
+      const results: { image: AIImage; prompt: string; index: number }[] = [];
       const failures: string[] = [];
-      if (imageParts.length > 0) {
-        let inputImage = await resolveMergedImageParts(
-          imageParts,
-          this.httpClient,
-          token,
-        );
-        if (!inputImage?.data) throw new Error("无法解析图片数据");
-        if (inputImage.data && inputImage.mimeType !== "image/png") {
+      let timedOut = false;
+      const generate = async (prompt: string): Promise<AIImage> => {
+        token.throwIfAborted();
+        const batch = await runAbortable(() => inputImage
+          ? this.aiService.editImage(withAvatarReferences(prompt), inputImage, token)
+          : this.aiService.generateImage(prompt, token), token);
+        if (!batch[0] || (!batch[0].data && !batch[0].url)) throw new Error("AI 回复为空");
+        return batch[0];
+      };
+      const generateWithRetry = async (prompt: string): Promise<AIImage> => {
+        for (let attempt = 0; ; attempt++) {
+          try { return await generate(prompt); } catch (error) {
+            if (token.aborted || attempt >= 1 || !isTransientImageError(error)) throw error;
+            await sleep(3500, token);
+          }
+        }
+      };
+      imagePhaseTimeoutId = setTimeout(() => token.abort("请求超时"), timeoutMs);
+      try {
+        for (let i = 0; i < imageCount; i++) {
+          token.throwIfAborted();
+          let prompt = perImagePrompts[i];
+          const fallback = normalizeSingleImagePrompt(originalPrompt, i, imageCount);
           try {
-            const pngBuffer = await sharp(inputImage.data).png().toBuffer();
-            inputImage = { data: pngBuffer, mimeType: "image/png" };
-          } catch {}
-        }
-        for (let i = 0; i < imageCount; i++) {
-          token.throwIfAborted();
-          const singlePrompt = perImagePrompts[i] || normalizeSingleImagePrompt(prompt, i, imageCount);
-          for (let attempt = 1; attempt <= 2; attempt++) {
+            let image: AIImage;
             try {
-              const batch = await this.aiService.editImage(withAvatarReferences(singlePrompt), inputImage, token);
-              images.push(...batch);
-              break;
-            } catch (error: any) {
-              if (!isTransientImageError(error) || attempt >= 2) {
-                failures.push(imageCount > 1 ? `第${i + 1}张: ${describeImageError(error)}` : describeImageError(error));
-                break;
-              }
-              await sleep(3500, token);
+              image = await generateWithRetry(prompt);
+            } catch (error) {
+              if (token.aborted || !optimizePrompt || prompt === fallback) throw error;
+              prompt = fallback;
+              image = await generate(prompt);
             }
+            results.push({ image, prompt, index: i });
+          } catch (error) {
+            if (token.aborted) throw error;
+            failures.push(`第${i + 1}张: ${describeImageError(error)}`);
           }
           if (i < imageCount - 1) await sleep(3500, token);
         }
-      } else {
-        for (let i = 0; i < imageCount; i++) {
-          token.throwIfAborted();
-          const singlePrompt = perImagePrompts[i] || normalizeSingleImagePrompt(prompt, i, imageCount);
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            try {
-              const batch = await this.aiService.generateImage(singlePrompt, token);
-              images.push(...batch);
-              break;
-            } catch (error: any) {
-              if (!isTransientImageError(error) || attempt >= 2) {
-                failures.push(imageCount > 1 ? `第${i + 1}张: ${describeImageError(error)}` : describeImageError(error));
-                break;
-              }
-              await sleep(3500, token);
-            }
-          }
-          if (i < imageCount - 1) await sleep(3500, token);
-        }
+      } catch (error) {
+        if (token.reason !== "请求超时" || results.length === 0) throw error;
+        timedOut = true;
+      } finally {
+        clearTimeout(imagePhaseTimeoutId);
+        imagePhaseTimeoutId = undefined;
       }
-      if (images.length === 0 && optimizePrompt && prompt !== originalPrompt) {
-        if (imageParts.length > 0) {
-          let fallbackInputImage = await resolveMergedImageParts(
-            imageParts,
-            this.httpClient,
-            token,
-          );
-          if (!fallbackInputImage?.data) throw new Error("无法解析图片数据");
-          if (fallbackInputImage.data && fallbackInputImage.mimeType !== "image/png") {
-            try {
-              const pngBuffer = await sharp(fallbackInputImage.data).png().toBuffer();
-              fallbackInputImage = { data: pngBuffer, mimeType: "image/png" };
-            } catch {}
-          }
-          for (let i = 0; i < imageCount; i++) {
-            token.throwIfAborted();
-            try {
-              const singlePrompt = normalizeSingleImagePrompt(originalPrompt, i, imageCount);
-              const batch = await this.aiService.editImage(withAvatarReferences(singlePrompt), fallbackInputImage, token);
-              images.push(...batch);
-            } catch {}
-            if (i < imageCount - 1) await sleep(3500, token);
-          }
-        } else {
-          for (let i = 0; i < imageCount; i++) {
-            token.throwIfAborted();
-            try {
-              const singlePrompt = normalizeSingleImagePrompt(originalPrompt, i, imageCount);
-              const batch = await this.aiService.generateImage(singlePrompt, token);
-              images.push(...batch);
-            } catch {}
-            if (i < imageCount - 1) await sleep(3500, token);
-          }
-        }
-      }
-      if (images.length === 0) {
-        if (wantsAvatar && imageParts.length > 0) {
-          const avatarPrompt = `${prompt}
 
-请根据我提供的头像特征生成表情包风格图片，保留人物/头像核心特征，但输出为新的独立表情包，不要直接返回空结果。`;
-          const retryImages: AIImage[] = [];
-          for (let i = 0; i < imageCount; i++) {
-            token.throwIfAborted();
-            const singlePrompt = normalizeSingleImagePrompt(avatarPrompt, i, imageCount);
-            try {
-              const batch = await this.aiService.generateImage(singlePrompt, token);
-              retryImages.push(...batch);
-            } catch {}
-            if (i < imageCount - 1) await sleep(3500, token);
-          }
-          if (retryImages.length > 0) {
-            images = retryImages;
-          }
-        }
-      }
-      if (images.length === 0) {
-        const detail = failures.length ? ("\n" + failures.join("\n")) : "";
-        const detailText = failures.join("\n");
-        throw new Error(detail || "AI 回复为空");
-      }
-      imageGenerationDone = true;
-      if (imageCount > 1) {
-        await this.messageUtils.sendImages(msg, images, imageCaption, replyToId, token);
-        if (generationStatusMsg) scheduleDeleteMessage(generationStatusMsg, 1);
-        if (failures.length > 0) {
-          await MessageSender.sendNew(msg, `⚠️ 已成功生成 ${images.length} 张，剩余张数失败。
-<blockquote expandable>${htmlEscape(failures.join("\n"))}</blockquote>`, { parseMode: "html" }, replyToId);
-        }
-      } else {
-        await this.messageUtils.sendImages(msg, images.slice(0, 1), imageCaption, replyToId, token);
-        if (generationStatusMsg) scheduleDeleteMessage(generationStatusMsg, 1);
+      if (results.length === 0) throw new Error(failures.join("\n") || "AI 回复为空");
+      // A generation timeout must not also cancel delivery of already completed images.
+      // Explicit user cancellation still stops the task without starting a new delivery.
+      if (timedOut) deliveryToken = this.aiService.createAbortToken();
+      const caption = imageCount > 1
+        ? results.map((item) => `${item.index + 1}. ${item.prompt}`).join("\n\n")
+        : results[0].prompt;
+      await this.messageUtils.sendImages(msg, results.map((item) => item.image), caption, replyToId, deliveryToken);
+      if (failures.length > 0 || timedOut) {
+        const detail = [...failures, ...(timedOut ? ["后续生成超时，已保留并发送完成的图片。"] : [])].join("\n");
+        await MessageSender.sendNew(msg,
+          `⚠️ 已成功生成 ${results.length}/${imageCount} 张。\n<blockquote expandable>${htmlEscape(detail)}</blockquote>`,
+          { parseMode: "html" }, replyToId);
       }
       await deleteMessageOrGroup(msg);
     } finally {
-      imageGenerationDone = true;
+      if (preparationTimeoutId) clearTimeout(preparationTimeoutId);
       if (imagePhaseTimeoutId) clearTimeout(imagePhaseTimeoutId);
       if (generationStatusMsg) scheduleDeleteMessage(generationStatusMsg, 1);
+      if (!token.aborted) token.abort("任务结束");
       this.aiService.releaseToken(token);
+      if (deliveryToken !== token) this.aiService.releaseToken(deliveryToken);
     }
   }
 }
