@@ -47,12 +47,13 @@ const axios = async options => {
   }
   if (realisticQuote || options.data.messages.length) {
     let y=10;const parts=[];const rows=omitMessage&&options.data.messages.length>1?options.data.messages.filter((_,index)=>index!==1):options.data.messages;
+    const fill=(options.data.backgroundColor||'#382545').split('/')[0];
     rows.forEach((row,index)=>{
       const h=row.replyMessage?115:64,w=(row.text||'').length<5?65:260;
-      parts.push(`<rect x="80" y="${y}" width="${w}" height="${h}" rx="13" fill="#302737"/><rect x="96" y="${y+15}" width="10" height="15" fill="white"/>`);
+      parts.push(`<rect x="80" y="${y}" width="${w}" height="${h}" rx="13" fill="${fill}"/><rect x="96" y="${y+15}" width="10" height="15" fill="white"/>`);
       if(row.replyMessage?.media?.kind==='story')parts.push(`<circle cx="128" cy="${y+44}" r="20" fill="#ff77bb"/>`);
       if((index===rows.length-1||row.from.id!==rows[index+1].from.id)&&!(omitAvatars&&rows.length>1))parts.push(`<circle cx="25" cy="${y+h-25}" r="25" fill="#77bbff"/>`);
-      if(joinBubbles&&rows.length>1&&index<rows.length-1)parts.push(`<rect x="100" y="${y+h-1}" width="20" height="10" fill="#302737"/>`);
+      if(joinBubbles&&rows.length>1&&index<rows.length-1)parts.push(`<rect x="100" y="${y+h-1}" width="20" height="10" fill="${fill}"/>`);
       y+=h+8;
     });
     const native=options.data.type==='png'&&options.data.style==='glass';
@@ -104,7 +105,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(quoteRequests.length, expectedImages);
   assert.equal(sent.length, expectedImages);
   assert.equal(quoteRequests[0].data.style, 'glass');
-  assert.equal(quoteRequests[0].data.backgroundColor, '#302737/#221d2a');
+  assert.equal(quoteRequests[0].data.backgroundColor, '#382545/#261a33');
   assert.equal(sent[0].replyTo, messages[0].id);
   return quoteRequests[0];
 }
@@ -279,7 +280,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   for(const emoji of ['🇨🇳','👨‍👩‍👧‍👦','1️⃣','❤️','🏳️‍🌈','👍🏽'])assert.equal(exportsObj._body({text:emoji}),emoji+'\u200b',`normal bubble for ${emoji}`);
   for(const text of ['123','普通文字','👍 好'])assert.equal(exportsObj._body({text}),text);
   requests=[];omitMessage=true;
-  const fallbackPayload={type:'quote',format:'webp',style:'glass',backgroundColor:'#302737/#221d2a',width:512,height:768,scale:2,messages:[
+  const fallbackPayload={type:'quote',format:'webp',style:'glass',backgroundColor:'#382545/#261a33',width:512,height:768,scale:2,messages:[
     {avatar:true,from:{id:991,first_name:'Author A',photo:{url:'data:image/png;base64,'+mediaFixture.toString('base64')}},senderTag:'标签 A',text:'甲'},
     {avatar:false,from:{id:991},text:'乙'},
     {avatar:true,from:{id:992,first_name:'Author B'},senderTag:'标签 B',text:'丙'},
