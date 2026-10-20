@@ -139,7 +139,12 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   responseData = await sharp({create: {width: 320, height: 160, channels: 4, background: '#302737'}}).webp({lossless:true}).toBuffer();
   let req = await run('.yvlux', [message(10, '小炸不算炸')]);
   assert.equal(req.url, 'https://quote.yuri.ly/generate.webp');
+  assert.equal(req.data.width,416,'short body lines use a narrower measure for larger text');
   assert.equal(req.data.messages[0].from.accentColorId, 6);
+  const longText='长消息'.repeat(100);
+  req = await run('.yvlux',[message(10,longText)]);
+  assert.equal(req.data.width,512,'long bodies retain the original line measure instead of truncating earlier');
+  assert.equal(req.data.messages[0].text,longText);
   req = await run('.yvlux', [{...message(10, '带成员标签'), peerId:new Api.PeerChannel({channelId: 1}), fromRank:'香香软软小男娘'}]);
   assert.equal(req.data.messages[0].senderTag, undefined,'backend header disabled');
   assert.equal((await exportsObj._tag({peerId:new Api.PeerChannel({channelId:1}),fromRank:'香香软软小男娘'},sender,client,new Map())).senderTagRole,'member','plain unboxed tag preset');
@@ -188,6 +193,18 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.ok(metadata.width <= 512);
   const fixture = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="240"><rect x="80" y="10" width="260" height="120" rx="26" fill="#302737" stroke="#808080" stroke-width="2"/><rect x="100" y="38" width="20" height="20" fill="#ffffff"/><circle cx="25" cy="101" r="25" fill="#ff4444"/></svg>')).webp({lossless:true}).toBuffer();
   const expanded = await exportsObj._expand(fixture);
+  const readable = await exportsObj._expand(fixture,[],[],false,1.18);
+  const bodyGlyph = async buffer => {
+    const {data,info}=await sharp(buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+    let left=info.width,right=-1,top=info.height,bottom=-1;
+    for(let y=0;y<info.height;y++)for(let x=0;x<info.width;x++){
+      const i=(y*info.width+x)*4;
+      if(Math.min(data[i],data[i+1],data[i+2])>=245 && data[i+3]>=245){left=Math.min(left,x);right=Math.max(right,x);top=Math.min(top,y);bottom=Math.max(bottom,y);}
+    }
+    return {width:right-left+1,height:bottom-top+1};
+  };
+  const normalGlyph=await bodyGlyph(expanded),readableGlyph=await bodyGlyph(readable);
+  assert.ok(readableGlyph.width>=normalGlyph.width*1.15 && readableGlyph.height>=normalGlyph.height*1.15,'body glyphs grow in both dimensions, beyond simply resaving a 512px image');
   const beforePixels = await sharp(fixture).ensureAlpha().raw().toBuffer();
   const afterPixels = await sharp(expanded).ensureAlpha().raw().toBuffer();
   assert.equal((await sharp(expanded).metadata()).width,512);
@@ -267,16 +284,16 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   const assembledMeta=await sharp(assembled).metadata();
   assert.equal(Math.max(assembledMeta.width,assembledMeta.height),512,'whole quote scales into sticker bounds');
   assert.ok(assembledMeta.height<240,'long single-line header widens the quote and scales all text together');
-  const parsed=exportsObj._parse('12 r n "新的 名字" t "新的 内容"');
-  assert.equal(parsed.count,12);assert.equal(parsed.r,true);assert.equal(parsed.customName,'新的 名字');assert.equal(parsed.customText,'新的 内容');
+  const parsed=exportsObj._parse('5 r n "新的 名字" t "新的 内容"');
+  assert.equal(parsed.count,5);assert.equal(parsed.r,true);assert.equal(parsed.customName,'新的 名字');assert.equal(parsed.customText,'新的 内容');
   const selected=exportsObj._parse('n "r" t "p n r" r p 8,1,6，6');
   assert.equal(selected.count,8);assert.deepEqual([...selected.pickPositions],[1,6,8]);assert.equal(selected.customName,'r');assert.equal(selected.customText,'p n r');
   assert.equal(exportsObj._parse('r 3 你好  世界\n第二行').customText,'你好  世界\n第二行');
-  assert.equal(exportsObj._parse('p 1,6,8,11,50,101,200').pickPositions.length,7,'no 5-message or 100-position plugin cap');
-  assert.equal(exportsObj._parse('500').count,500,'large continuous count accepted');
+  assert.equal(exportsObj._parse('p 1,6,8,101,200').pickPositions.length,5,'limit counts selected messages, not the highest selected position');
+  for(const input of ['6','500','p 1,6,8,11,50,101','pick 1,2,3,4,5,6','r 6 n A g B','p 1,2,3,4,5,6 t X'])assert.throws(()=>exportsObj._parse(input),/一次最多选择 5 条/);
   assert.equal(exportsObj._parse('g ""').customTag,'','explicit empty tag hides automatic group label');
   assert.equal(exportsObj._parse('g "r" n "g"').customTag,'r','quoted reserved words can be tags');
-  for(const selector of ['','8','p 2,4,6'])for(let flags=0;flags<16;flags++){
+  for(const selector of ['','5','p 2,4,6'])for(let flags=0;flags<16;flags++){
     const options=[selector,flags&1?'r':'',flags&2?'n "New Name"':'',flags&4?'t "New Text"':'',flags&8?'g "New Tag"':''].filter(Boolean).reverse().join(' ');
     const combined=exportsObj._parse(options);
     assert.equal(combined.r,!!(flags&1));assert.equal(combined.customName,flags&2?'New Name':undefined);assert.equal(combined.customText,flags&4?'New Text':undefined);assert.equal(combined.customTag,flags&8?'New Tag':undefined);
@@ -287,9 +304,9 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   const many=Array.from({length:12},(_,i)=>message(10+i*3,`original-${i+1}`,i%3===1?b:a));
   many[0].isReply=true;many[0].getReplyMessage=async()=>message(9,'引用内容');
   fetchOptions=[];
-  await run('.yvlux 12 r n "新的 名字" t "第一条已替换" g "自定义群标签"',many,{},3);
+  await run('.yvlux 5 r n "新的 名字" t "第一条已替换" g "自定义群标签"',many);
   let batches=requests.filter(req=>req.data.type==='quote').map(req=>req.data.messages);
-  assert.deepEqual(batches.map(batch=>batch.length),[5,5,2]);
+  assert.deepEqual(batches.map(batch=>batch.length),[5]);
   assert.equal(batches[0][0].text,'第一条已替换');assert.equal(batches[0][0].replyMessage.text,'引用内容');
   assert.equal(batches[0][1].text,'original-2','t only changes first selected message');
   for(const batch of batches){assert.equal(batch[0].avatar,true,'each image starts with full sender profile');for(const item of batch)assert.equal(item.from.first_name,item.from.id===7?'新的 名字':'Original B','n only changes first selected author');}
@@ -297,13 +314,13 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(a.firstName,'Original A','real sender object remains unchanged');
   assert.equal(fetchOptions[0].maxId,200,'command excluded from continuous fetch');
   const sameAuthor=Array.from({length:12},(_,i)=>message(10+i,`same-${i+1}`,a));
-  await run('.yvlux 12 n Nick',sameAuthor,{},3);
+  await run('.yvlux 5 n Nick',sameAuthor);
   batches=requests.filter(req=>req.data.type==='quote').map(req=>req.data.messages);
   assert.ok(batches.every(batch=>batch[0].avatar && batch[0].from.first_name==='Nick'),'same-author continuation restores header on every image');
   const seven=Array.from({length:8},(_,i)=>message(10+i*2,`pick-${i+1}`,i===2?b:a));
-  await run('.yvlux p 1,2,3,4,5,6,8 r n New t Custom',seven,{},2);
+  await run('.yvlux p 1,2,3,6,8 r n New t Custom',seven);
   batches=requests.filter(req=>req.data.type==='quote').map(req=>req.data.messages);
-  assert.equal(batches.flat().length,7);assert.equal(batches[1][1].text,'pick-8');
+  assert.equal(batches.flat().length,5);assert.equal(batches[0].at(-1).text,'pick-8');
   const past100=Array.from({length:110},(_,i)=>message(10+i,`position-${i+1}`,i===100?b:a));
   await run('.yvlux p 101,102 n Picked',past100,{replyTo:{quoteText:'must not override message 101'}});
   const distant=requests.find(req=>req.data.type==='quote').data.messages;
@@ -318,10 +335,15 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(pages,2,'fetches the missing real message after a service entry');
   history=sameAuthor;requests=[];sent=[];
   const normalSend=client.sendFile;let failureText='',revoked=false,failedPath;
-  client.sendFile=async(peer,options)=>{if(sent.length===1){failedPath=options.file;throw Error('synthetic upload failure');}return normalSend(peer,options);};
-  await plugin.cmdHandlers.yvlux({id:200,peerId:1,message:'.yvlux 12',getReplyMessage:async()=>sameAuthor[0],edit:async options=>{failureText=options.text;},delete:async()=>{revoked=true;}});
+  client.sendFile=async(peer,options)=>{failedPath=options.file;throw Error('synthetic upload failure');};
+  await plugin.cmdHandlers.yvlux({id:200,peerId:1,message:'.yvlux 5',getReplyMessage:async()=>sameAuthor[0],edit:async options=>{failureText=options.text;},delete:async()=>{revoked=true;}});
   client.sendFile=normalSend;
-  assert.equal(sent.length,1);assert.equal(revoked,false);assert.match(failureText,/第 2 张发送失败（已发送 1 张）/);assert.equal(fs.existsSync(failedPath),false,'failed upload temporary file is cleaned up');
+  assert.equal(sent.length,0);assert.equal(revoked,false);assert.match(failureText,/第 1 张发送失败（已发送 0 张）/);assert.equal(fs.existsSync(failedPath),false,'failed upload temporary file is cleaned up');
+  for(const command of ['.yvlux 6','.yvlux p 1,2,3,4,5,6 r n Name g Tag']){
+    requests=[];fetchOptions=[];let text='';
+    await plugin.cmdHandlers.yvlux({id:200,peerId:1,message:command,getReplyMessage:async()=>sameAuthor[0],edit:async options=>{text=options.text;}});
+    assert.match(text,/一次最多选择 5 条/);assert.equal(requests.length,0);assert.equal(fetchOptions.length,0,'over-limit commands stop before fetching history or rendering');
+  }
   // 本次报错的根因：空消息被跳过、纯表情改成裸贴纸、布局数量与消息不一致。
   const emojiMessages=[message(10,'👍'),message(12,'😂😂'),message(14,'')];
   const emojiRequest=await run('.yvlux 3',emojiMessages);
@@ -369,7 +391,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(quoteInputs[0].messages[0].senderTag,'只改 B');assert.equal(quoteInputs[0].messages[0].from.first_name,'新 B');
   assert.equal(quoteInputs[0].messages[1].senderTag,'原标签 A','other selected authors retain their real group tag');
   if(tagLive&&process.env.YVLUX_PREVIEW_DIR)await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-custom-tag.png'));
-  await run('.yvlux 8 g ""',taggedRows,{},2);
+  await run('.yvlux 5 g ""',taggedRows);
   for(const batch of quoteInputs)for(const item of batch.messages)if(item.avatar)assert.equal(item.senderTag,item.from.id===7?'':'原标签 B','empty override stays hidden after paging and returning to the same author');
   assert.equal(taggedRows[0].fromRank,'原标签 A','custom tag never changes source Telegram membership');
   liveQuote=false;omitMessage=true;
@@ -412,7 +434,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   }
   client.downloadProfilePhoto=async()=>photo;
   realisticQuote=true;liveQuote=live;
-  const selectors=['','8','p 1,2,3,4,5,6'];let matrixCases=0;
+  const selectors=['','5','p 1,2,3,4,6'];let matrixCases=0;
   const kinds=live?['photo']:['text','photo','sticker','video','tgs','gif'];
   for(const kind of kinds)for(const selector of selectors)for(let flags=0;flags<8;flags++) {
     const who={id:700,firstName:'Alpha 完整昵称',color:{color:6}},other={id:800,firstName:'Beta 完整昵称',color:{color:5}};
@@ -425,8 +447,9 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     rows[1].isReply=true;rows[1].getReplyMessage=async()=>rows[0];
     const options=[selector,flags&1?'r':'',flags&2?'n "改名 Alpha"':'',flags&4?'t "自定义内容"':''].filter(Boolean);
     if(flags&2)options.reverse(); // 交错顺序，避免测试只覆盖文档的排列。
-    const count=selector===''?1:selector==='8'?8:6;
-    await run('.yvlux '+options.join(' '),rows,{},Math.ceil(count/5));
+    const count=selector===''?1:5;
+    await run('.yvlux '+options.join(' '),rows);
+    assert.ok(quoteInputs.every(batch=>batch.messages.length<=5),'all mode combinations respect the five-message command limit');
     assert.equal(rows[0].message,kind==='text'?'测试消息1':'','t must not mutate original message');
     const apiRequests=requests.filter(request=>request.data.type==='quote');
     for(const batch of quoteInputs)for(const row of batch.messages)if(row.avatar){
@@ -435,6 +458,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     }
     for(const request of apiRequests) {
       assert.equal(request.url,'https://quote.yuri.ly/generate.webp');
+      assert.equal(request.data.width,416,'body line measure is narrower so the final sticker does not shrink long lines as much');
       assert.ok(request.data.messages.every(row=>row.media===undefined),'unsupported media data URLs stay local');
     }
     if((flags&1)&&count>1&&kind!=='text')assert.equal(apiRequests[0].data.messages[1].replyMessage.media.kind,'story','photo-only reply reserves a thumbnail');
@@ -446,7 +470,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
       assert.ok(glass>10,`${kind}/${selector}/${flags}: visible translucent glass`);
       assert.ok(blue>10,`${kind}/${selector}/${flags}: local avatar/media retained`);
     }
-    if(live&&selector==='8'&&flags===7&&process.env.YVLUX_PREVIEW_DIR) {
+    if(live&&selector==='5'&&flags===7&&process.env.YVLUX_PREVIEW_DIR) {
       fs.mkdirSync(process.env.YVLUX_PREVIEW_DIR,{recursive:true});
       for(const [index,file]of sent.entries())await sharp(file.bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,`yvlux-fixed-combination-${index+1}.png`));
     }
@@ -466,7 +490,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   await run('.yvlux p 2,4 r n "只改 Beta" t "跳选正文"',[photoSource,reply,message(14,'skip'),message(17,'Alpha 原名')]);
   assert.equal(quoteInputs[0].messages[0].from.first_name,'只改 Beta');assert.equal(quoteInputs[0].messages[1].from.first_name,'GoMami');
   liveQuote=false;realisticQuote=false;
-  console.log(`PASS: ${matrixCases} complete mode combinations (${live?'real drawing API':'local image fixtures'}), glass material, local photos, photo-only replies, tags, rename scope, immutable source messages, and pagination.`);
+  console.log(`PASS: ${matrixCases} complete mode combinations (${live?'real drawing API':'local image fixtures'}), glass material, local photos, photo-only replies, tags, rename scope, immutable source messages, and five-message limit.`);
   // s/config/api/help 路由以及真正的上传文件/文档类型；不连接 Telegram。
   const os=require('node:os'),configDir=fs.mkdtempSync(path.join(os.tmpdir(),'yvlux-config-test-'));
   plugin.configPath=path.join(configDir,'config.json');
@@ -517,5 +541,5 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     }
   } finally {fs.unlinkSync(plugin.configPath);fs.rmdirSync(configDir);}
   console.log('PASS: help, configuration persistence/validation, API reset/isolation, photo upload and existing/new sticker packs, static/TGS/video sticker preservation (mock Telegram).');
-  console.log('PASS: syntax/rendering; unboxed single-line full names; proportional sizing; combined p/r/n/t; quoted/legacy parsing; removed count/position caps; 12-message pagination; rename scope; cross-image sender restoration; partial-send errors and cleanup; media/API compatibility.');
+  console.log('PASS: syntax/rendering; unboxed single-line full names; larger body glyphs; combined p/r/n/t; quoted/legacy parsing; five-message cap with arbitrary pick positions; rename scope; send errors and cleanup; media/API compatibility.');
 })().catch(e => {console.error(e); process.exitCode = 1;});
