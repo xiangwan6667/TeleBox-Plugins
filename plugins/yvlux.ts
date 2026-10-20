@@ -426,7 +426,9 @@ const help_text = `
 
 默认文字语录使用深紫渐变玻璃气泡（圆角、细描边、顶部高光）。
 自动带上发送者在当前群的成员标签；四周留白更宽，高光保持原样。
-带媒体的语录仍使用原增强版 API；自定义 API 需支持 glass 样式。
+图片和引用缩略图在本地合成，保留同样的玻璃气泡和无框群标签。
+视频、GIF 和动态贴纸在语录中使用静态预览；s 保存模式保留原贴纸。
+自定义 API 需支持 glass 样式。
 `;
 
 /**
@@ -495,7 +497,7 @@ interface YvluConfig {
   _comment?: string;
 }
 
-// 新版 Quote API 原生绘制 glass 气泡；媒体保留原增强版渲染路径。
+// 默认文字绘图共用 glass 路径；头像、媒体和引用预览在本地合成。
 const DEFAULT_API_URL = "https://quote.yuri.ly/generate.webp";
 const MEDIA_API_URL = "https://quote-api-enhanced.zhetengsha.eu.org/generate.webp";
 const QUOTE_APPEARANCE = {
@@ -657,7 +659,7 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
 }
 
 /** 扩大气泡内边距，复用原文字图层和 glass 高光参数。 */
-async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[] = []): Promise<Buffer> {
+async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[] = [], messages: any[] = []): Promise<Buffer> {
   const sharp = (await import("sharp")).default;
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = info;
@@ -683,7 +685,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
   const avatars = parts.filter(p => p.left === 0 && p.right >= 7 && Math.abs(p.right + 1 - (p.bottom - p.top + 1)) <= 3);
   if (!avatars.length) return buffer;
   const scale = (avatars[0].right + 1) / 50;
-  const bubbles = parts.filter(p => p.left > 1 && p.right - p.left + 1 >= 90 * scale && p.pixels.length > (p.right - p.left + 1) * (p.bottom - p.top + 1) * 0.65)
+  const bubbles = parts.filter(p => p.left >= 44 * scale && p.right - p.left + 1 >= 32 * scale && p.pixels.length > (p.right - p.left + 1) * (p.bottom - p.top + 1) * 0.65)
     .sort((a, b) => a.top - b.top);
   if (!bubbles.length) return buffer;
   // 按参考图保持紧凑比例：原内边距 16px → 18px，不缩放字形。
@@ -695,21 +697,37 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     const w = Math.max(1, Math.round(meta.width! * scale / 2)), h = Math.max(1, Math.round(meta.height! * scale / 2));
     return { buffer: await sharp(headers[index]).resize(w, h).png().toBuffer(), width: w, height: h };
   }));
+  const decodeImage = (url?: string) => {
+    const match = /^data:image\/[\w.+-]+;base64,(.+)$/i.exec(url || "");
+    return match ? Buffer.from(match[1], "base64") : undefined;
+  };
+  const images = await Promise.all(bubbles.map(async (_, index) => {
+    const source = decodeImage(messages[index]?.media?.url);
+    if (!source) return undefined;
+    const result = await sharp(source).resize({ width: Math.max(1, Math.round(300 * scale)), height: Math.max(1, Math.round(220 * scale)), fit: "inside" }).png().toBuffer({ resolveWithObject: true });
+    return { buffer: result.data, width: result.info.width, height: result.info.height };
+  }));
   const extraHeaderHeight = renderedHeaders.reduce((sum, header) => sum + (header ? header.height + Math.round(12 * scale) : 0), 0);
-  const outWidth = Math.max(width + extra * 2, Math.ceil(112 * scale) + Math.max(0, ...renderedHeaders.map(header => header?.width || 0)));
-  const outHeight = height + bubbles.length * extra * 2 + extraHeaderHeight;
+  const extraImageHeight = images.reduce((sum, image) => sum + (image ? image.height + Math.round(12 * scale) : 0), 0);
+  // 只扩大消息之间的留白：同人约 2→8px，不同人约 8→14px，保留分组层级。
+  const messageGap = Math.max(1, Math.round(6 * scale));
+  const outWidth = Math.max(width + extra * 2, Math.ceil(112 * scale) + Math.max(0, ...renderedHeaders.map(header => header?.width || 0), ...images.map(image => image?.width || 0)));
+  const outHeight = height + bubbles.length * extra * 2 + extraHeaderHeight + extraImageHeight + (bubbles.length - 1) * messageGap;
   const layers: any[] = [];
   const finishMasks: any[] = [];
   const finishRegions: any[] = [];
+  const protectedImages: any[] = [];
   let start = 0, offsetY = 0;
   for (const [index, bubble] of bubbles.entries()) {
+    if (index) offsetY += messageGap;
     const end = index + 1 < bubbles.length ? Math.floor((bubble.bottom + bubbles[index + 1].top) / 2) + 1 : height;
     const bandAvatars = avatars.filter(p => (p.top + p.bottom) / 2 >= start && (p.top + p.bottom) / 2 < end);
     const middle = Math.floor((bubble.top + bubble.bottom) / 2);
     const bodyLeft = Math.min(...bubble.pixels.filter((pixel: number) => Math.floor(pixel / width) === middle).map((pixel: number) => pixel % width));
     const oldW = bubble.right - bodyLeft + 1, oldH = bubble.bottom - bubble.top + 1;
     const header = renderedHeaders[index], headerHeight = header ? header.height + Math.round(12 * scale) : 0;
-    const w = Math.max(oldW + extra * 2, (header?.width || 0) + Math.round(36 * scale)), h = oldH + extra * 2 + headerHeight;
+    const image = images[index], imageHeight = image ? image.height + Math.round(12 * scale) : 0;
+    const w = Math.max(oldW + extra * 2, Math.max(header?.width || 0, image?.width || 0) + Math.round(36 * scale)), h = oldH + extra * 2 + headerHeight + imageHeight;
     // 参考图的圆角与正文字号比例约为 1.1，保持饱满且紧凑。
     const radius = Math.min(27 * scale, w / 2, h / 2), grouped = 7 * scale;
     // 相邻气泡原来的小圆角可由边角 alpha 判断，保留同人连续消息的分组形状。
@@ -743,12 +761,35 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     if (content.width <= 0 || content.height <= 0) return buffer;
     layers.push({ input: await sharp(buffer).extract(content).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra + headerHeight });
     if (header) layers.push({ input: header.buffer, left: bodyLeft + Math.round(18 * scale), top: bubble.top + offsetY + Math.round(18 * scale) });
+    const addImage = async (source: Buffer, left: number, top: number, imageW: number, imageH: number, radius: number) => {
+      const rounded = await sharp(source).resize(imageW, imageH, { fit: "cover" }).composite([{ input: Buffer.from(`<svg width="${imageW}" height="${imageH}"><rect width="${imageW}" height="${imageH}" rx="${radius}" fill="white"/></svg>`), blend: "dest-in" }]).png().toBuffer();
+      layers.push({ input: rounded, left, top });
+      protectedImages.push({ left, top, width: imageW, height: imageH });
+    };
+    if (image) await addImage(image.buffer, bodyLeft + Math.round(18 * scale), bubble.bottom + offsetY + extra + headerHeight + Math.round(4 * scale), image.width, image.height, Math.max(1, Math.round(8 * scale)));
+    const replyImage = decodeImage(messages[index]?.replyMessage?.media?.url);
+    if (replyImage) {
+      // 后端只接受远程图片 URL。先用 story 环预留 40px 缩略图，再以本地图片替换。
+      const thumbX = bodyLeft + Math.round(28 * scale), centerX = thumbX + Math.round(20 * scale);
+      let thumbY = bubble.top + Math.round(24 * scale);
+      for (let y = bubble.top + Math.round(18 * scale); y < Math.min(bubble.bottom, bubble.top + Math.round(42 * scale)); y++) {
+        const p = (y * width + centerX) * 4, rgb = [data[p], data[p + 1], data[p + 2]];
+        if (Math.max(...rgb) > 90 && Math.max(...rgb) - Math.min(...rgb) > 35) { thumbY = y - 1; break; }
+      }
+      const size = Math.max(1, Math.round(40 * scale));
+      const left = thumbX + extra, top = thumbY + offsetY + extra + headerHeight, radius = Math.max(1, Math.round(4 * scale));
+      // 先擦除占位环，透明贴纸的空白处不能透出原来的 story 图案。
+      const sampleX = Math.min(width - 1, thumbX + size + Math.round(3 * scale)), sampleY = Math.min(height - 1, thumbY + Math.round(size / 2));
+      const sample = (sampleY * width + sampleX) * 4;
+      layers.push({ input: Buffer.from(`<svg width="${size}" height="${size}"><rect width="${size}" height="${size}" rx="${radius}" fill="rgb(${data[sample]},${data[sample + 1]},${data[sample + 2]})"/></svg>`), left, top });
+      await addImage(replyImage, left, top, size, size, radius);
+    }
     // 头像只移动到底部，大小和内容保持原样。
     for (const avatar of bandAvatars) {
-      layers.push({ input: await sharp(buffer).extract({ left: avatar.left, top: avatar.top, width: avatar.right - avatar.left + 1, height: avatar.bottom - avatar.top + 1 }).png().toBuffer(), left: avatar.left, top: avatar.top + offsetY + extra * 2 + headerHeight });
+      layers.push({ input: await sharp(buffer).extract({ left: avatar.left, top: avatar.top, width: avatar.right - avatar.left + 1, height: avatar.bottom - avatar.top + 1 }).png().toBuffer(), left: avatar.left, top: avatar.top + offsetY + extra * 2 + headerHeight + imageHeight });
     }
     start = end;
-    offsetY += extra * 2 + headerHeight;
+    offsetY += extra * 2 + headerHeight + imageHeight;
   }
   const output = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(layers).raw().toBuffer();
   const finishMask = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(finishMasks).raw().toBuffer();
@@ -756,6 +797,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     for (let y = region.top; y < Math.min(outHeight, region.top + region.height); y++) {
       for (let x = region.left; x < Math.min(outWidth, region.left + region.width); x++) {
         const pixel = (y * outWidth + x) * 4;
+        if (protectedImages.some(image => x >= image.left && x < image.left + image.width && y >= image.top && y < image.top + image.height)) continue;
         const mask = finishMask[pixel] * finishMask[pixel + 3] / (255 * 255);
         const brightest = Math.max(output[pixel], output[pixel + 1], output[pixel + 2]);
         // 保留文字、昵称和标签的亮色；背景用宽柔光和轻微透光呈现玻璃层次。
@@ -833,6 +875,67 @@ async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buf
   return sharp(data, { raw: { width, height, channels: 4 } }).webp({ lossless: true }).toBuffer();
 }
 
+/** 语录中的媒体统一为本地预览，避免旧媒体接口绕过玻璃、全名和群标签处理。 */
+async function getQuoteMediaPreview(message: any): Promise<{ url: string } | undefined> {
+  const media = message.media;
+  if (!(media instanceof Api.MessageMediaPhoto) && !(media instanceof Api.MessageMediaDocument)) return undefined;
+  const mime = media.document?.mimeType || "image/jpeg";
+  if (!/^(image\/|video\/|application\/x-tgsticker)/.test(mime)) return undefined;
+  const sharp = (await import("sharp")).default;
+  const isPhoto = media instanceof Api.MessageMediaPhoto;
+  // 照片取正文；视频/动画先用 Telegram 提供的缩略图，避免不必要的转码依赖。
+  let buffer: Buffer | undefined;
+  if (!isPhoto) {
+    try {
+      const thumbs = (media.document?.thumbs || []).filter((thumb: any) => thumb.w && thumb.h).sort((a: any, b: any) => b.w * b.h - a.w * a.h);
+      const thumb = await message.downloadMedia({ thumb: thumbs[0] || 0 });
+      if (Buffer.isBuffer(thumb) && thumb.length) buffer = await sharp(thumb).png().toBuffer();
+    } catch {}
+  }
+  if (!buffer) {
+    const full = await message.downloadMedia();
+    if (!Buffer.isBuffer(full) || !full.length) throw new Error("媒体预览下载失败");
+    if (isTgsFormat(full)) {
+      const dependencies = await checkTgsDependencies();
+      if (!dependencies.ok) throw new Error(dependencies.message);
+      buffer = await convertTgsToWebm(full);
+    } else buffer = full;
+    if (isWebmFormat(buffer) || isMp4Format(buffer)) {
+      const os = await import("os");
+      const input = path.join(os.tmpdir(), `yvlux_preview_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+      try {
+        fs.writeFileSync(input, buffer);
+        const { stdout } = await execFileAsync("ffmpeg", ["-v", "error", "-i", input, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"], { encoding: "buffer", maxBuffer: 20 * 1024 * 1024, timeout: 30000 });
+        buffer = stdout as any;
+      } finally { try { fs.unlinkSync(input); } catch {} }
+    }
+  }
+  const png = await sharp(buffer).rotate().resize({ width: 900, height: 900, fit: "inside", withoutEnlargement: true }).png().toBuffer();
+  return { url: `data:image/png;base64,${png.toString("base64")}` };
+}
+
+async function uploadQuoteStickerImage(client: any, source: Buffer): Promise<any> {
+  const sharp = (await import("sharp")).default;
+  let buffer = await sharp(source).rotate().resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
+  if (buffer.length > 512 * 1024) buffer = await sharp(buffer).webp({ quality: 85 }).toBuffer();
+  const { width, height } = await sharp(buffer).metadata();
+  // uploadFile 需要 size/arrayBuffer；裸 Buffer 加 name 仍不是有效的上传文件。
+  const file = await client.uploadFile({ file: {
+    name: "sticker.webp", size: buffer.length,
+    arrayBuffer: async () => Uint8Array.from(buffer).buffer,
+  }, workers: 1 });
+  const uploaded = await client.invoke(new Api.messages.UploadMedia({
+    peer: new Api.InputPeerSelf(),
+    media: new Api.InputMediaUploadedDocument({
+      file, mimeType: "image/webp",
+      attributes: [new Api.DocumentAttributeFilename({ fileName: "sticker.webp" }), new Api.DocumentAttributeImageSize({ w: width!, h: height! })],
+    }),
+  }));
+  const doc = uploaded?.document;
+  if (!doc?.id || !doc.accessHash) throw new Error("未能取得上传图片的贴纸文档");
+  return new Api.InputDocument({ id: doc.id, accessHash: doc.accessHash, fileReference: doc.fileReference || Buffer.alloc(0) });
+}
+
 
 class YvluPlugin extends Plugin {
   // 设置插件帮助描述（会被核心管理器抓取显示）
@@ -904,8 +1007,8 @@ class YvluPlugin extends Plugin {
     try {
       let url = this.config?.apiUrl;
       // 检查当前配置中是否有自定义地址，没有则使用默认
-      if (!url || !url.trim()) {
-        url = quoteData.messages.some((message: any) => message.media) ? MEDIA_API_URL : DEFAULT_API_URL;
+      if (!url || !url.trim() || url.trim() === MEDIA_API_URL) {
+        url = DEFAULT_API_URL;
       }
 
       let data = quoteData;
@@ -919,12 +1022,21 @@ class YvluPlugin extends Plugin {
             if (!groupFrom || groupFrom.id !== message.from.id || message.avatar) {
               groupFrom = message.from;
             }
+            const localContent = {
+              ...message, senderTag: undefined, senderTagRole: undefined, media: undefined,
+              // 即使图片没有配文也保留一个可识别的基础气泡，实际图片稍后本地合成。
+              text: message.text || (message.media ? "\u200b" : ""),
+              replyMessage: message.replyMessage ? {
+                ...message.replyMessage,
+                media: message.replyMessage.media?.url?.startsWith("data:image/") ? { kind: "story" } : undefined,
+              } : undefined,
+            };
             if (message.avatar) return {
-              ...message, senderTag: undefined,
+              ...localContent,
               from: { ...message.from, name: false, first_name: message.from.first_name || message.from.name, photo: undefined },
             };
             return {
-              ...message,
+              ...localContent,
               from: {
                 ...groupFrom,
                 ...message.from,
@@ -959,7 +1071,7 @@ class YvluPlugin extends Plugin {
         buffer = await sharp(buffer).resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
       }
       if (url === DEFAULT_API_URL) {
-        buffer = await expandGlassPadding(buffer, headers);
+        buffer = await expandGlassPadding(buffer, headers, quoteData.messages);
         buffer = await restoreGlassAvatars(buffer, quoteData.messages);
       }
       return { buffer, ext: "webp" };
@@ -1121,25 +1233,28 @@ class YvluPlugin extends Plugin {
               }
             }
 
+            // 只修改本次渲染副本，避免 n/t/局部引用影响后续组合或原消息对象。
+            let messageText = message.message || "", messageEntities = message.entities || [];
             // ================= 自定义文字覆盖逻辑 (合并项) =================
             // i === 0 意味着这是你刚刚 Reply 对准的那条消息
             if (i === 0) {
               let replyTo = (trigger || msg)?.replyTo;
               if (customText) {
                 // 如果传入了自定义文字，强行替换文案并清空原本的排版样式（Entities）
-                message.message = customText;
-                message.entities = [];
+                messageText = customText;
+                messageEntities = [];
               } else if (replyTo?.quoteText && message.id === replied.id) {
                 // 如果使用了 Telegram 原生部分文字引用功能，覆盖为引用文本
-                message.message = replyTo.quoteText;
-                message.entities = replyTo.quoteEntities;
+                messageText = replyTo.quoteText;
+                messageEntities = replyTo.quoteEntities || [];
               }
             }
 
-            const entities = convertEntities(message.entities || []);
+            const entities = convertEntities(messageEntities);
 
             // ================= 回复块(Reply Header)构造逻辑 =================
             let replyBlock: any | undefined;
+            let replySource: any;
             if (r) {
               try {
                 const replyHeader: any = (message as any).replyTo;
@@ -1150,6 +1265,7 @@ class YvluPlugin extends Plugin {
                   try {
                     const repliedMsg = await message.getReplyMessage();
                     if (repliedMsg) {
+                      replySource = repliedMsg;
                       const repliedSender = await repliedMsg.getSender();
                       if (repliedSender) {
                         replyChatId = Number(repliedSender.id);
@@ -1176,6 +1292,7 @@ class YvluPlugin extends Plugin {
                   try {
                     const repliedMsg = await message.getReplyMessage();
                     if (repliedMsg) {
+                      replySource = repliedMsg;
                       const repliedSender = await repliedMsg.getSender();
                       let replyName = "unknown";
                       let replyChatId: number | undefined;
@@ -1190,7 +1307,7 @@ class YvluPlugin extends Plugin {
                       const replyText = repliedMsg.message || "";
                       const replyEntities = convertEntities(repliedMsg.entities || []);
 
-                      if (replyText) {
+                      if (replyText || repliedMsg.media) {
                         replyBlock = {
                           name: replyName,
                           text: replyText,
@@ -1204,77 +1321,14 @@ class YvluPlugin extends Plugin {
               } catch (e) {
                 console.warn("处理回复引用失败: ", e);
               }
-            }
-
-            // ================= 媒体(多媒体文件)下载与格式转换逻辑 =================
-            let media: { url: string } | undefined = undefined;
-            try {
-              if (message.media) {
-                let mediaTypeForQuote: string | undefined = undefined;
-                // 检测它是否为 Sticker(贴纸属性)
-                const isSticker =
-                  message.media instanceof Api.MessageMediaDocument &&
-                  (message.media as Api.MessageMediaDocument).document &&
-                  ((message.media as Api.MessageMediaDocument).document as any).attributes?.some(
-                    (a: any) => a instanceof Api.DocumentAttributeSticker
-                  );
-
-                if (isSticker) {
-                  mediaTypeForQuote = "sticker";
-                } else {
-                  mediaTypeForQuote = "photo";
-                }
-
-                const mimeType = (message.media as any).document?.mimeType;
-                const isTgsSticker = isSticker && mimeType === "application/x-tgsticker";
-                const isGifOrMp4 = mimeType === "video/mp4" || mimeType === "image/gif";
-                // 如果是动态内容，我们不能只下载缩略图(thumb)
-                const isAnimatedContent = (isSticker && (mimeType === "video/webm" || mimeType === "image/webp" || isTgsSticker)) || isGifOrMp4;
-
-                const buffer = await (message as any).downloadMedia({
-                  ...(isAnimatedContent ? {} : { thumb: 1 }),
-                });
-
-                if (Buffer.isBuffer(buffer)) {
-                  let finalBuffer = buffer;
-                  let finalMime = mimeType;
-
-                  // TGS 转 WebM 逻辑注入
-                  if (isTgsSticker || isTgsFormat(buffer)) {
-                    try {
-                      const depCheck = await checkTgsDependencies();
-                      if (!depCheck.ok) {
-                        console.error(`[yvlu] ${depCheck.message}`);
-                      } else {
-                        console.log(`[yvlu] 检测到 TGS 贴纸，开始转换为 WebM...`);
-                        finalBuffer = await convertTgsToWebm(buffer);
-                        finalMime = "video/webm";
-                        console.log(`[yvlu] TGS -> WebM 转换成功，大小: ${finalBuffer.length}`);
-                      }
-                    } catch (convertError) {
-                      console.error(`[yvlu] TGS 转换失败:`, convertError);
-                    }
-                  } 
-                  // MP4/GIF 转 WebM 逻辑注入
-                  else if (isGifOrMp4 || isMp4Format(buffer)) {
-                    try {
-                      console.log(`[yvlu] 检测到 GIF/MP4，开始转换为 WebM...`);
-                      finalBuffer = await convertMp4ToWebm(buffer);
-                      finalMime = "video/webm";
-                      console.log(`[yvlu] MP4 -> WebM 转换成功，大小: ${finalBuffer.length}`);
-                    } catch (convertError) {
-                      console.error(`[yvlu] MP4 转换失败:`, convertError);
-                    }
-                  }
-
-                  const mime = finalMime || (mediaTypeForQuote === "sticker" ? "image/webp" : "image/jpeg");
-                  const base64 = finalBuffer.toString("base64");
-                  media = { url: `data:${mime};base64,${base64}` };
-                }
+              if (replySource?.media) {
+                const preview = await getQuoteMediaPreview(replySource);
+                if (preview && replyBlock) replyBlock = { ...replyBlock, text: replyBlock.text || "图片", media: preview };
               }
-            } catch (e) {
-              console.error("下载媒体失败", e);
             }
+
+            // 文本和媒体共用本地玻璃合成；下载失败直接报告，不静默漏掉图片。
+            const media = await getQuoteMediaPreview(message);
 
             items.push({
               ...(shouldShowAvatar ? await getQuoteSenderTag(message, sender, client, participantCache) : {}),
@@ -1289,7 +1343,7 @@ class YvluPlugin extends Plugin {
                 // 保留 Telegram 的昵称强调色，不把所有人的昵称强制改成同一种颜色。
                 accentColorId: (sender as any).color?.color,
               },
-              text: message.message || "",
+              text: messageText,
               entities: entities,
               avatar: shouldShowAvatar,
               media,
@@ -1486,6 +1540,7 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
    */
   async handleApiCommand(msg: Api.Message, args: string[]) {
     try {
+      if (args.length > 1) throw new Error("API 设置请单独使用，只提供一个 URL 或 reset");
       await this.loadConfig();
       const sub = args[0];
 
@@ -1619,14 +1674,7 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
             return;
           }
 
-          // 【BUG 修复】：摒弃 CustomFile，直接给 Buffer 添加 name 属性，完美欺骗底层的 isBuffer 检测
-          const bufferFile = Buffer.from(buffer) as any;
-          bufferFile.name = "sticker.png";
-
-          const file = await client.uploadFile({
-            file: bufferFile,
-            workers: 1,
-          });
+          const document = await uploadQuoteStickerImage(client, buffer);
 
           await client.invoke(
             new Api.stickers.AddStickerToSet({
@@ -1634,7 +1682,7 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
                 shortName: this.config.stickerSetShortName,
               }),
               sticker: new Api.InputStickerSetItem({
-                document: file as any,
+                document,
                 emoji: "📝",
               }),
             })
@@ -1676,14 +1724,7 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
           return;
         }
 
-        // 【BUG 修复】：通过 Buffer 与 name 属性的挂载，替换易引发引用碰撞的 CustomFile
-        const bufferFile = Buffer.from(buffer) as any;
-        bufferFile.name = "sticker.png";
-
-        firstSticker = await client.uploadFile({
-          file: bufferFile,
-          workers: 1,
-        });
+        firstSticker = await uploadQuoteStickerImage(client, buffer);
       }
 
       if (!firstSticker) {
@@ -1699,6 +1740,8 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
           userId: me,
           title: `${this.config!.stickerSetShortName}`,
           shortName: this.config!.stickerSetShortName,
+          animated: isSticker && (replied.media as any)?.document?.mimeType === "application/x-tgsticker" || undefined,
+          videos: isSticker && (replied.media as any)?.document?.mimeType === "video/webm" || undefined,
           stickers: [
             new Api.InputStickerSetItem({
               document: firstSticker,

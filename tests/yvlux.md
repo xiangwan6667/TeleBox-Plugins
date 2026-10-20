@@ -1,0 +1,24 @@
+# yvlux 检查
+
+Node.js 22+，需要 `typescript` 和 `sharp`。`YVLUX_TEST_DEPS` 可指向单独安装依赖的目录。
+
+```text
+node tests/yvlux.test.cjs
+```
+
+默认完全离线，使用本地图片和模拟 Telegram 客户端：
+
+- 144 组：单条/连续/p 跳选 × r/n/t 的 8 个子集 × 文本/照片/贴纸/视频/TGS/GIF 缩略图。
+- 检查实际输出的玻璃透明度、头像/媒体像素、512px 尺寸、无框群标签数据、改名范围和分张。
+- 覆盖完整单行姓名、短气泡、跨页作者资料恢复、服务消息/消息 ID 空洞、原生局部引用、原消息不被修改、上传失败进度与文件清理。
+- 检查 help/config/api/s；保存图片时验证上传文件形状、`UploadMedia` 和 `InputDocument`，覆盖新建/追加以及原始静态/TGS/视频贴纸。
+
+访问真实默认绘图接口，使用合成照片跑 24 组生成组合：
+
+```text
+node tests/yvlux.test.cjs --live
+```
+
+另有单条图片引用、局部引用和从第二条开始跳选的定向检查。真实接口检查仍使用模拟 Telegram 客户端，不读取 Telegram 登录信息、不发送消息、不创建或修改真实贴纸包。设置 `YVLUX_PREVIEW_DIR` 可保存完整组合模式及图片引用的预览。
+
+安装 ffmpeg 后，加上 `--media-tools` 可验证无缩略图 MP4/WebM 的真实首帧提取和 GIF 解码。无缩略图 TGS 转码另依赖宿主的 Python rlottie；当前环境缺少该依赖，这条路径未做运行验证。动画在语录中显示静态预览，`s` 对已有贴纸保留原始文件。

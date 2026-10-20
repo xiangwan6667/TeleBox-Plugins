@@ -13,10 +13,11 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 });
 assert.equal(compiled.diagnostics.length, 0, 'TypeScript syntax');
-let requests = [], sent = [], history = [], responseData, fetchOptions=[];
+let requests = [], sent = [], history = [], responseData, fetchOptions=[], realisticQuote=false;
+let liveQuote=false, liveSerial=0, quoteInputs=[];
 const classes = new Map();
 const Api = new Proxy({}, {get(_, key) {
-  if (key === 'channels' || key === 'messages') {
+  if (key === 'channels' || key === 'messages' || key === 'stickers') {
     if (!classes.has(key)) classes.set(key, new Proxy({}, {get(_, name) {
       const fullName = `${key}.${String(name)}`;
       if (!classes.has(fullName)) classes.set(fullName, class {constructor(args) {Object.assign(this, args);this.className = fullName;}});
@@ -29,10 +30,30 @@ const Api = new Proxy({}, {get(_, key) {
 }});
 const axios = async options => {
   requests.push(options);
+  if (liveQuote) {
+    const os=require('node:os'),{execFile}=require('node:child_process'),{promisify}=require('node:util');
+    const stem=path.join(os.tmpdir(),`yvlux-live-${process.pid}-${++liveSerial}`),input=stem+'.json',output=stem+'.bin';
+    try {
+      fs.writeFileSync(input,JSON.stringify(options.data));
+      const {stdout}=await promisify(execFile)('curl.exe',['--silent','--show-error','--max-time','55','--header','Content-Type: application/json','--data-binary','@'+input,'--output',output,'--write-out','%{http_code}',options.url]);
+      assert.equal(stdout,'200',`live quote HTTP ${stdout}`);return {data:fs.readFileSync(output),status:200};
+    } finally {for(const file of [input,output])try{fs.unlinkSync(file);}catch{}}
+  }
   if (options.data.type === 'png' && options.data.style === 'classic') {
     const rows=options.data.messages;
     const rects=rows.map((row,index)=>`<rect x="100" y="${10+index*110}" width="20" height="30" fill="white"/><rect x="140" y="${10+index*110}" width="${Math.max(16,Math.min(480,[...row.from.name].length*20))}" height="30" fill="white"/>`).join('');
     return {data:await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="${rows.length*110+30}">${rects}</svg>`)).png().toBuffer(),status:200};
+  }
+  if (realisticQuote) {
+    let y=10;const parts=[];const rows=options.data.messages;
+    rows.forEach((row,index)=>{
+      const h=row.replyMessage?115:64,w=row.text.length<5?65:260;
+      parts.push(`<rect x="80" y="${y}" width="${w}" height="${h}" rx="13" fill="#302737"/><rect x="96" y="${y+15}" width="10" height="15" fill="white"/>`);
+      if(row.replyMessage?.media?.kind==='story')parts.push(`<circle cx="128" cy="${y+44}" r="20" fill="#ff77bb"/>`);
+      if(index===rows.length-1||row.from.id!==rows[index+1].from.id)parts.push(`<circle cx="25" cy="${y+h-25}" r="25" fill="#77bbff"/>`);
+      y+=h+8;
+    });
+    return {data:await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="512" height="${y+10}">${parts.join('')}</svg>`)).webp({lossless:true}).toBuffer(),status:200};
   }
   return {data: responseData, status: 200};
 };
@@ -54,15 +75,17 @@ const mockRequire = name => {
   if (name === '@utils/tlRevive') return {reviveEntities: e => e};
   return require(name);
 };
-vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;', {
+vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;', {
   require: mockRequire, exports: exportsObj, Buffer, console: {log() {}, warn() {}, error() {}},
 });
 const plugin = exportsObj.default;
 plugin.config = {apiUrl: '', stickerSetShortName: ''};
+const generate=plugin.generateQuote.bind(plugin);
+plugin.generateQuote=async data=>{quoteInputs.push(data);return generate(data);};
 const sender = {id: 7, firstName: 'GoMami', color: {color: 6}};
 const message = (id, text, who = sender) => ({id, message: text, peerId: 1, entities: [], getSender: async () => who});
 async function run(command, messages, extra = {}, expectedImages = 1) {
-  history = messages; requests = []; sent = [];
+  history = messages; requests = []; sent = []; quoteInputs=[];
   let deleted = false, edits = [];
   const msg = {
     id: 200, peerId: 1, message: command, ...extra,
@@ -102,19 +125,23 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(req.data.messages[0].text, '自定义语录');
   req = await run('.yvlux r', [{...message(10, '回复内容'), isReply:true, getReplyMessage: async () => message(9, '引用原文')}]);
   assert.equal(req.data.messages[0].replyMessage.text, '引用原文');
-  const payload = {messages: [{from: {id:7}, media: {url: 'data:video/webm;base64,AA=='}}]};
+  const payload = {messages: [{from: {id:7}, media: {url: 'data:image/png;base64,AA=='}}]};
   requests = [];
   await plugin.generateQuote(payload);
-  assert.equal(requests[0].url, 'https://quote-api-enhanced.zhetengsha.eu.org/generate.webp');
+  assert.equal(requests[0].url, 'https://quote.yuri.ly/generate.webp');
+  assert.equal(requests[0].data.messages[0].media,undefined,'local photos must not switch to legacy API or be sent as unsupported data URLs');
   payload.messages[0].media.url = 'data:image/jpeg;base64,AA==';
   requests = [];
   await plugin.generateQuote(payload);
-  assert.equal(requests[0].url, 'https://quote-api-enhanced.zhetengsha.eu.org/generate.webp', 'photo quote retains media backend');
+  assert.equal(requests[0].url, 'https://quote.yuri.ly/generate.webp', 'photo quote retains glass backend');
   const animatedWebp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBPANIM'), Buffer.alloc(10)]);
   payload.messages[0].media.url = 'data:image/webp;base64,' + animatedWebp.toString('base64');
   requests = [];
   await plugin.generateQuote(payload);
-  assert.equal(requests[0].url, 'https://quote-api-enhanced.zhetengsha.eu.org/generate.webp');
+  assert.equal(requests[0].url, 'https://quote.yuri.ly/generate.webp');
+  plugin.config.apiUrl='https://quote-api-enhanced.zhetengsha.eu.org/generate.webp';
+  requests=[];await plugin.generateQuote(payload);
+  assert.equal(requests[0].url,'https://quote.yuri.ly/generate.webp','legacy built-in URL also migrates to glass');
   plugin.config.apiUrl = 'https://example.invalid/generate.webp';
   requests = [];
   await plugin.generateQuote(payload);
@@ -231,5 +258,139 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   await plugin.cmdHandlers.yvlux({id:200,peerId:1,message:'.yvlux 12',getReplyMessage:async()=>sameAuthor[0],edit:async options=>{failureText=options.text;},delete:async()=>{revoked=true;}});
   client.sendFile=normalSend;
   assert.equal(sent.length,1);assert.equal(revoked,false);assert.match(failureText,/第 2 张发送失败（已发送 1 张）/);assert.equal(fs.existsSync(failedPath),false,'failed upload temporary file is cleaned up');
+  // 所有有效选择器 × r/n/t 子集，分别覆盖文本、图片、贴纸及动画缩略图。
+  // --live 只针对合成测试图片访问默认绘图接口，Telegram 始终是模拟客户端。
+  const live=process.argv.includes('--live');
+  const photo=await sharp(Buffer.from('<svg width="240" height="160"><rect width="240" height="160" fill="#358cbb"/><circle cx="110" cy="70" r="45" fill="#fcbb55"/><path d="M0 160 L60 100 L120 160 L190 90 L240 160" fill="#1d5263"/></svg>')).png().toBuffer();
+  const largeThumb=new Api.PhotoSize({w:320,h:240,type:'m'}),smallThumb=new Api.PhotoSize({w:90,h:90,type:'s'});
+  let thumbChoice;
+  await exportsObj._preview({media:new Api.MessageMediaDocument({document:{mimeType:'video/mp4',thumbs:[smallThumb,largeThumb]}}),downloadMedia:async options=>{thumbChoice=options.thumb;return photo;}});
+  assert.equal(thumbChoice,largeThumb,'prefer the largest thumbnail, not a stripped tiny preview');
+  assert.equal(await exportsObj._preview({media:new Api.MessageMediaWebPage({}),downloadMedia:async()=>{throw Error('webpage must not be treated as a photo');}}),undefined);
+  await assert.rejects(()=>exportsObj._preview({media:new Api.MessageMediaPhoto({}),downloadMedia:async()=>undefined}),/下载失败/);
+  if(process.argv.includes('--media-tools')) {
+    const os=require('node:os'),{execFile}=require('node:child_process'),{promisify}=require('node:util');
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),'yvlux-media-test-'));
+    try {
+      for(const [extension,mime]of [['mp4','video/mp4'],['webm','video/webm']]) {
+        const file=path.join(dir,'sample.'+extension);
+        await promisify(execFile)('ffmpeg',['-v','error','-f','lavfi','-i','color=c=blue:s=120x80:d=0.2','-frames:v','1',file]);
+        const raw=fs.readFileSync(file);
+        const preview=await exportsObj._preview({media:new Api.MessageMediaDocument({document:{mimeType:mime}}),downloadMedia:async options=>options?undefined:raw});
+        const metadata=await sharp(Buffer.from(preview.url.split(',')[1],'base64')).metadata();assert.equal(metadata.width,120);assert.equal(metadata.height,80);
+      }
+      const gif=await sharp(photo).gif().toBuffer();
+      const preview=await exportsObj._preview({media:new Api.MessageMediaDocument({document:{mimeType:'image/gif'}}),downloadMedia:async options=>options?undefined:gif});
+      assert.equal((await sharp(Buffer.from(preview.url.split(',')[1],'base64')).metadata()).format,'png');
+    } finally {for(const file of fs.readdirSync(dir))fs.unlinkSync(path.join(dir,file));fs.rmdirSync(dir);}
+    console.log('PASS: real ffmpeg MP4/WebM first-frame extraction and thumbnail-less GIF preview.');
+  }
+  client.downloadProfilePhoto=async()=>photo;
+  realisticQuote=true;liveQuote=live;
+  const selectors=['','8','p 1,2,3,4,5,6'];let matrixCases=0;
+  const kinds=live?['photo']:['text','photo','sticker','video','tgs','gif'];
+  for(const kind of kinds)for(const selector of selectors)for(let flags=0;flags<8;flags++) {
+    const who={id:700,firstName:'Alpha 完整昵称',color:{color:6}},other={id:800,firstName:'Beta 完整昵称',color:{color:5}};
+    const rows=Array.from({length:8},(_,i)=>({...message(10+i*2,i===1?'好':`测试消息${i+1}`,i===2?other:who),peerId:new Api.PeerChannel({channelId:99}),fromRank:i===2?'群标签乙':'群标签甲'}));
+    if(kind!=='text') {
+      rows[0].message='';
+      rows[0].media=kind==='photo'?new Api.MessageMediaPhoto({}):new Api.MessageMediaDocument({document:{mimeType:{sticker:'image/webp',video:'video/mp4',tgs:'application/x-tgsticker',gif:'image/gif'}[kind],attributes:kind==='sticker'||kind==='tgs'?[new Api.DocumentAttributeSticker({})]:[]}});
+      rows[0].downloadMedia=async()=>photo;
+    }
+    rows[1].isReply=true;rows[1].getReplyMessage=async()=>rows[0];
+    const options=[selector,flags&1?'r':'',flags&2?'n "改名 Alpha"':'',flags&4?'t "自定义内容"':''].filter(Boolean);
+    if(flags&2)options.reverse(); // 交错顺序，避免测试只覆盖文档的排列。
+    const count=selector===''?1:selector==='8'?8:6;
+    await run('.yvlux '+options.join(' '),rows,{},Math.ceil(count/5));
+    assert.equal(rows[0].message,kind==='text'?'测试消息1':'','t must not mutate original message');
+    const apiRequests=requests.filter(request=>request.data.type==='quote');
+    for(const batch of quoteInputs)for(const row of batch.messages)if(row.avatar){
+      assert.equal(row.senderTag,row.from.id===700?'群标签甲':'群标签乙','every sender and page retains the unboxed group tag');
+      assert.equal(row.from.first_name,row.from.id===700&&(flags&2)?'改名 Alpha':row.from.id===700?'Alpha 完整昵称':'Beta 完整昵称','rename does not affect another author');
+    }
+    for(const request of apiRequests) {
+      assert.equal(request.url,'https://quote.yuri.ly/generate.webp');
+      assert.ok(request.data.messages.every(row=>row.media===undefined),'unsupported media data URLs stay local');
+    }
+    if((flags&1)&&count>1&&kind!=='text')assert.equal(apiRequests[0].data.messages[1].replyMessage.media.kind,'story','photo-only reply reserves a thumbnail');
+    for(const file of sent) {
+      const {data,info}=await sharp(file.bytes).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+      assert.ok(info.width<=512&&info.height<=512);
+      let glass=0,blue=0;
+      for(let i=0;i<data.length;i+=4){if(data[i+3]>200&&data[i+3]<250&&Math.max(data[i],data[i+1],data[i+2])<90)glass++;if(Math.abs(data[i]-53)<3&&Math.abs(data[i+1]-140)<3&&Math.abs(data[i+2]-187)<3)blue++;}
+      assert.ok(glass>10,`${kind}/${selector}/${flags}: visible translucent glass`);
+      assert.ok(blue>10,`${kind}/${selector}/${flags}: local avatar/media retained`);
+    }
+    if(live&&selector==='8'&&flags===7&&process.env.YVLUX_PREVIEW_DIR) {
+      fs.mkdirSync(process.env.YVLUX_PREVIEW_DIR,{recursive:true});
+      for(const [index,file]of sent.entries())await sharp(file.bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,`yvlux-fixed-combination-${index+1}.png`));
+    }
+    matrixCases++;
+    if(live)console.log(`LIVE ${matrixCases}/24: ${options.join(' ')||'single'} (${sent.length} image(s))`);
+    else if(matrixCases%24===0)console.log(`LOCAL ${matrixCases}/144 mode combinations passed`);
+  }
+  const photoSource={...message(5,''),media:new Api.MessageMediaPhoto({}),downloadMedia:async()=>photo};
+  const reply={...message(10,'回复图片',{id:801,firstName:'Reply Author'}),isReply:true,getReplyMessage:async()=>photoSource,peerId:new Api.PeerChannel({channelId:99}),fromRank:'引用者标签'};
+  await run('.yvlux r n "引用名" t "新的正文"',[reply]);
+  assert.ok(quoteInputs[0].messages[0].replyMessage.media.url.startsWith('data:image/png;'));
+  assert.equal(quoteInputs[0].messages[0].replyMessage.text,'图片','photo-only referenced message is not dropped');
+  assert.equal(quoteInputs[0].messages[0].senderTag,'引用者标签');
+  reply.replyTo={quote:true,quoteText:'节选文字',quoteEntities:[]};
+  await run('.yvlux r',[reply]);assert.equal(quoteInputs[0].messages[0].replyMessage.text,'节选文字','partial quote retains text and thumbnail together');
+  if(live&&process.env.YVLUX_PREVIEW_DIR)await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-fixed-image-reply.png'));
+  await run('.yvlux p 2,4 r n "只改 Beta" t "跳选正文"',[photoSource,reply,message(14,'skip'),message(17,'Alpha 原名')]);
+  assert.equal(quoteInputs[0].messages[0].from.first_name,'只改 Beta');assert.equal(quoteInputs[0].messages[1].from.first_name,'GoMami');
+  liveQuote=false;realisticQuote=false;
+  console.log(`PASS: ${matrixCases} complete mode combinations (${live?'real drawing API':'local image fixtures'}), glass material, local photos, photo-only replies, tags, rename scope, immutable source messages, and pagination.`);
+  // s/config/api/help 路由以及真正的上传文件/文档类型；不连接 Telegram。
+  const os=require('node:os'),configDir=fs.mkdtempSync(path.join(os.tmpdir(),'yvlux-config-test-'));
+  plugin.configPath=path.join(configDir,'config.json');
+  fs.writeFileSync(plugin.configPath,JSON.stringify({apiUrl:'',stickerSetShortName:'TestQuotes'}));
+  let calls=[],uploads=[],packExists=true;
+  client.getMe=async()=>({id:7});
+  client.uploadFile=async({file})=>{
+    assert.equal(typeof file.size,'number');assert.equal(typeof file.arrayBuffer,'function');
+    const bytes=Buffer.from(await file.arrayBuffer());assert.equal(bytes.length,file.size);
+    const metadata=await sharp(bytes).metadata();assert.equal(metadata.format,'webp');assert.equal(Math.max(metadata.width,metadata.height),512);
+    uploads.push(bytes);return new Api.InputFile({id:123,name:file.name});
+  };
+  client.invoke=async request=>{
+    calls.push(request);
+    if(request.className==='messages.GetStickerSet'){if(!packExists)throw {errorMessage:'STICKERSET_INVALID'};return new Api.messages.StickerSet({});}
+    if(request.className==='messages.UploadMedia'){
+      assert.ok(request.peer instanceof Api.InputPeerSelf);assert.ok(request.media instanceof Api.InputMediaUploadedDocument);assert.equal(request.media.mimeType,'image/webp');
+      return new Api.MessageMediaDocument({document:{id:999,accessHash:888,fileReference:Buffer.from('ref')}});
+    }
+    if(request.className==='stickers.AddStickerToSet'||request.className==='stickers.CreateStickerSet') {
+      const item=request.sticker||request.stickers[0];assert.ok(item.document instanceof Api.InputDocument,'stickerset accepts InputDocument, never the upload InputFile');
+    }
+    return {};
+  };
+  const route=async(command,reply)=>{
+    let text='';requests=[];
+    await plugin.cmdHandlers.yvlux({message:'.yvlux '+command,peerId:1,id:200,edit:async o=>{text=o.text;},getReplyMessage:async()=>reply});
+    assert.equal(requests.length,0,'management routes must not call drawing API');return text;
+  };
+  try {
+    for(const help of ['help','h','?'])assert.match(await route(help),/组合示例/);
+    assert.match(await route('api'),/当前 API/);assert.match(await route('api example.com'),/https:\/\/example.com\/generate.webp/);
+    const savedUrl=JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl;
+    assert.match(await route('api reset r'),/单独使用/);assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,savedUrl);
+    assert.match(await route('api reset'),/重置/);assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,'');
+    assert.match(await route('config'),/当前配置/);assert.match(await route('config sticker UpdatedQuotes'),/已设置/);
+    assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).stickerSetShortName,'UpdatedQuotes');
+    assert.match(await route('config sticker bad-name'),/字母、数字和下划线/);
+    assert.match(await route('s r'),/单独使用/);assert.match(await route('s'),/请回复/);assert.match(await route('s',message(10,'text')),/不包含媒体/);
+    const image={...message(10,''),media:new Api.MessageMediaPhoto({}),downloadMedia:async()=>photo};
+    assert.match(await route('s',image),/成功/);assert.equal(uploads.length,1);assert.ok(calls.some(c=>c.className==='messages.UploadMedia'));
+    packExists=false;assert.match(await route('s',image),/创建竣工/);assert.equal(uploads.length,2);
+    for(const mime of ['image/webp','application/x-tgsticker','video/webm']) {
+      calls=[];const sticker={...message(10,''),media:new Api.MessageMediaDocument({document:{id:33,accessHash:44,mimeType:mime,attributes:[new Api.DocumentAttributeSticker({})]}})};
+      packExists=true;assert.match(await route('s',sticker),/成功/);assert.equal(uploads.length,2,'original sticker is reused without conversion');
+      packExists=false;assert.match(await route('s',sticker),/创建竣工/);
+      const create=calls.find(c=>c.className==='stickers.CreateStickerSet');assert.equal(!!create.animated,mime==='application/x-tgsticker');assert.equal(!!create.videos,mime==='video/webm');
+    }
+  } finally {fs.unlinkSync(plugin.configPath);fs.rmdirSync(configDir);}
+  console.log('PASS: help, configuration persistence/validation, API reset/isolation, photo upload and existing/new sticker packs, static/TGS/video sticker preservation (mock Telegram).');
   console.log('PASS: syntax/rendering; unboxed single-line full names; proportional sizing; combined p/r/n/t; quoted/legacy parsing; removed count/position caps; 12-message pagination; rename scope; cross-image sender restoration; partial-send errors and cleanup; media/API compatibility.');
 })().catch(e => {console.error(e); process.exitCode = 1;});
