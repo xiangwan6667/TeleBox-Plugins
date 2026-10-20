@@ -407,20 +407,25 @@ const help_text = `
 <b>YVLUX · 语录贴纸</b>
 回复消息使用，多条自动分张。
 
-<code>${commandName} [数量]</code> 单条 / 连续多条
-<code>${commandName} p 1,3,6</code> 跳选消息
-<code>r</code> 带引用 · <code>n "名字"</code> 改名
-<code>g "标签"</code> 改标签 · <code>t "文字"</code> 改正文
-n / g 作用于首条作者，t 只改首条；<code>g ""</code> 隐藏标签。
+<b>生成语录</b>
+• <code>${commandName} [数量]</code> — 单条 / 连续多条
+• <code>${commandName} p 1,3,6</code> — 跳选消息
+• <code>${commandName} r [数量]</code> — 包含回复引用
+• <code>${commandName} n "名字"</code> — 自定义姓名
+• <code>${commandName} g "标签"</code> — 自定义标签
+• <code>${commandName} g ""</code> — 隐藏标签
+• <code>${commandName} 文字</code> — 自定义正文
 
 <b>组合示例</b>
-<code>${commandName} p 1,3,6 r n "小王" g "群友"</code>
-数量与 p 二选一，其余可叠加；带空格或与选项同名的内容加引号。
+<code>${commandName} 3 n "小王" g "群友"</code>
+<code>${commandName} p 1,3 r t "文字"</code>
+数量与 p 二选一；n/g 只改首条作者，t 只改首条消息。带空格或与选项同名的内容加引号。
 
-<b>单独使用</b>
-<code>${commandName} s</code> 保存图片 / 贴纸
-<code>${commandName} config sticker 名称</code> 设置贴纸包
-<code>${commandName} api URL|reset</code> 设置 / 重置接口
+<b>贴纸与设置（单独使用）</b>
+• <code>${commandName} s</code> — 保存图片 / 贴纸
+• <code>${commandName} config sticker 名称</code> — 设置贴纸包
+• <code>${commandName} api URL</code> — 设置接口
+• <code>${commandName} api reset</code> — 重置接口
 `;
 
 /**
