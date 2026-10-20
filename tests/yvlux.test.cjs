@@ -80,7 +80,7 @@ const mockRequire = name => {
   if (name === '@utils/tlRevive') return {reviveEntities: e => e};
   return require(name);
 };
-vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;', {
+vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;exports._clearHeaders=()=>quoteHeaderCache.clear();', {
   require: mockRequire, exports: exportsObj, Buffer, console: {log() {}, warn() {}, error() {}},
 });
 const plugin = exportsObj.default;
@@ -223,18 +223,26 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(exportsObj._parse('r 3 你好  世界\n第二行').customText,'你好  世界\n第二行');
   assert.equal(exportsObj._parse('p 1,6,8,11,50,101,200').pickPositions.length,7,'no 5-message or 100-position plugin cap');
   assert.equal(exportsObj._parse('500').count,500,'large continuous count accepted');
-  for(const bad of ['0','-1','9007199254740992','p 0','p 1,a','3 p 1,2','p 1,2 3','n','n ""','n "missing','t','n A n B','t X t Y','r s'])assert.throws(()=>exportsObj._parse(bad),undefined,bad);
+  assert.equal(exportsObj._parse('g ""').customTag,'','explicit empty tag hides automatic group label');
+  assert.equal(exportsObj._parse('g "r" n "g"').customTag,'r','quoted reserved words can be tags');
+  for(const selector of ['','8','p 2,4,6'])for(let flags=0;flags<16;flags++){
+    const options=[selector,flags&1?'r':'',flags&2?'n "New Name"':'',flags&4?'t "New Text"':'',flags&8?'g "New Tag"':''].filter(Boolean).reverse().join(' ');
+    const combined=exportsObj._parse(options);
+    assert.equal(combined.r,!!(flags&1));assert.equal(combined.customName,flags&2?'New Name':undefined);assert.equal(combined.customText,flags&4?'New Text':undefined);assert.equal(combined.customTag,flags&8?'New Tag':undefined);
+  }
+  for(const bad of ['0','-1','9007199254740992','p 0','p 1,a','3 p 1,2','p 1,2 3','n','n ""','n "missing','t','n A n B','t X t Y','r s','g','g r','n g','g A g B','g "" g B','g A s'])assert.throws(()=>exportsObj._parse(bad),undefined,bad);
   responseData=await sharp({create:{width:320,height:160,channels:4,background:'#302737'}}).webp({lossless:true}).toBuffer();
   const a={id:7,firstName:'Original A',color:{color:6}},b={id:8,firstName:'Original B'};
   const many=Array.from({length:12},(_,i)=>message(10+i*3,`original-${i+1}`,i%3===1?b:a));
   many[0].isReply=true;many[0].getReplyMessage=async()=>message(9,'引用内容');
   fetchOptions=[];
-  await run('.yvlux 12 r n "新的 名字" t "第一条已替换"',many,{},3);
+  await run('.yvlux 12 r n "新的 名字" t "第一条已替换" g "自定义群标签"',many,{},3);
   let batches=requests.filter(req=>req.data.type==='quote').map(req=>req.data.messages);
   assert.deepEqual(batches.map(batch=>batch.length),[5,5,2]);
   assert.equal(batches[0][0].text,'第一条已替换');assert.equal(batches[0][0].replyMessage.text,'引用内容');
   assert.equal(batches[0][1].text,'original-2','t only changes first selected message');
   for(const batch of batches){assert.equal(batch[0].avatar,true,'each image starts with full sender profile');for(const item of batch)assert.equal(item.from.first_name,item.from.id===7?'新的 名字':'Original B','n only changes first selected author');}
+  for(const batch of quoteInputs)for(const item of batch.messages)if(item.avatar)assert.equal(item.senderTag,item.from.id===7?'自定义群标签':undefined,'custom tag follows only the first selected author across groups and pages');
   assert.equal(a.firstName,'Original A','real sender object remains unchanged');
   assert.equal(fetchOptions[0].maxId,200,'command excluded from continuous fetch');
   const sameAuthor=Array.from({length:12},(_,i)=>message(10+i,`same-${i+1}`,a));
@@ -300,6 +308,28 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     assert.equal(Math.max(recoveredMeta.width,recoveredMeta.height),512);
   }
   console.log('PASS: pure emoji/empty-message normalization; incomplete backend layout retries preserve every message, header/tag alignment, uniform scale, and grouped avatars.');
+  const tagLive=process.argv.includes('--tag-live');
+  if(tagLive){exportsObj._clearHeaders();liveQuote=true;}
+  const taggedRows=Array.from({length:8},(_,i)=>({...message(10+i*2,`tag-${i+1}`,i===1?b:a),peerId:new Api.PeerChannel({channelId:99}),fromRank:i===1?'原标签 B':'原标签 A'}));
+  await run('.yvlux g "私人 标签 🌸"',[taggedRows[0]]);
+  assert.equal(quoteInputs[0].messages[0].senderTag,'私人 标签 🌸');
+  await run('.yvlux p 2,3,4 g "只改 B" n "新 B"',taggedRows);
+  assert.equal(quoteInputs[0].messages[0].senderTag,'只改 B');assert.equal(quoteInputs[0].messages[0].from.first_name,'新 B');
+  assert.equal(quoteInputs[0].messages[1].senderTag,'原标签 A','other selected authors retain their real group tag');
+  if(tagLive&&process.env.YVLUX_PREVIEW_DIR)await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-custom-tag.png'));
+  await run('.yvlux 8 g ""',taggedRows,{},2);
+  for(const batch of quoteInputs)for(const item of batch.messages)if(item.avatar)assert.equal(item.senderTag,item.from.id===7?'':'原标签 B','empty override stays hidden after paging and returning to the same author');
+  assert.equal(taggedRows[0].fromRank,'原标签 A','custom tag never changes source Telegram membership');
+  liveQuote=false;omitMessage=true;
+  await run('.yvlux 3 g "恢复后的标签"',taggedRows);
+  omitMessage=false;
+  assert.equal(quoteInputs[0].messages[0].senderTag,'恢复后的标签');assert.equal(quoteInputs[0].messages[1].senderTag,'原标签 B');assert.equal(quoteInputs[0].messages[2].senderTag,'恢复后的标签');
+  assert.equal(requests.filter(request=>request.data.type==='png'&&request.data.style==='glass').length,3,'custom tag is preserved on structured layout recovery');
+  let compactHelp='';
+  await plugin.cmdHandlers.yvlux({message:'.yvlux help',edit:async options=>{compactHelp=options.text;}});
+  assert.match(compactHelp,/g "标签"/);assert.match(compactHelp,/组合示例/);assert.equal(plugin.description,compactHelp);
+  assert.ok(compactHelp.replace(/<[^>]+>/g,'').length<450,'help stays compact');assert.doesNotMatch(compactHelp,/增强版|高光|本地合成|旧接口|后端/);
+  console.log('PASS: g custom/hidden tags, all 48 r/n/t/g selector combinations parsed, author scope, paging, real tag preservation, and compact help.');
   if(process.argv.includes('--layout-only'))return;
   // 所有有效选择器 × r/n/t 子集，分别覆盖文本、图片、贴纸及动画缩略图。
   // --live 只针对合成测试图片访问默认绘图接口，Telegram 始终是模拟客户端。

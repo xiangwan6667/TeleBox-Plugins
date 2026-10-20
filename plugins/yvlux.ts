@@ -328,10 +328,10 @@ function parseQuoteOptions(input: string) {
     tokens.push({ value, start, quoted: !!quote });
   }
   let count = 1, countSet = false, pickPositions: number[] | undefined, r = false;
-  let customName: string | undefined, customText: string | undefined;
-  const valueAfter = (index: number, mode: string) => {
+  let customName: string | undefined, customText: string | undefined, customTag: string | undefined;
+  const valueAfter = (index: number, mode: string, allowEmpty = false) => {
     const token = tokens[index + 1];
-    if (!token || !token.value.trim() || (!token.quoted && /^(p|pick|r|n|t|s|config|api)$/i.test(token.value))) throw new Error(`${mode} 后需要提供内容；包含空格或保留字时用引号包住`);
+    if (!token || (!token.value.trim() && !(allowEmpty && token.quoted)) || (!token.quoted && /^(p|pick|r|n|t|g|s|config|api)$/i.test(token.value))) throw new Error(`${mode} 后需要提供内容；包含空格或保留字时用引号包住`);
     return token.value;
   };
   for (let i = 0; i < tokens.length; i++) {
@@ -348,6 +348,9 @@ function parseQuoteOptions(input: string) {
     } else if (mode === "t") {
       if (customText !== undefined) throw new Error("自定义文字只能设置一次");
       customText = valueAfter(i, "t"); i++;
+    } else if (mode === "g") {
+      if (customTag !== undefined) throw new Error("g 标签只能设置一次");
+      customTag = valueAfter(i, "g", true).trim(); i++;
     } else if (!token.quoted && /^[+-]?\d+$/.test(token.value)) {
       if (countSet || pickPositions) throw new Error("连续数量和 p 跳选只能选择一种");
       count = Number(token.value); countSet = true;
@@ -360,7 +363,7 @@ function parseQuoteOptions(input: string) {
       break;
     }
   }
-  return { count, pickPositions, r, customName, customText };
+  return { count, pickPositions, r, customName, customText, customTag };
 }
 
 function splitQuoteMessages(items: any[], perImage = 5): any[][] {
@@ -399,36 +402,25 @@ async function fetchQuoteMessages(client: any, replied: any, beforeId: number, n
   return [...found.values()].sort((a, b) => a.id - b.id).slice(0, needed);
 }
 
-// 包含自定义修改后的 Help 文档字符串
+// 简洁的命令菜单，同时用于插件说明和 help。
 const help_text = `
-<b>🎨 YVLU 语录生成器 (增强版)</b>
+<b>YVLUX · 语录贴纸</b>
+回复消息使用，多条自动分张。
 
-<b>1. 生成语录</b>
-• <code>${commandName} [数量]</code> - 从回复消息起连续选取，超过 5 条自动分张
-• <code>${commandName} p 1,6,8</code> - 按实际消息序号跳选，无原先 5 条/100 序号限制
-• <code>${commandName} r [数量]</code> - 包含被引用(Reply)的消息进行生成
-• <code>${commandName} &lt;自定义文字&gt;</code> - <b>修改回复消息的内容</b>为自定义文字进行生成
-• <code>${commandName} n "新名字"</code> - 修改首条所选消息作者的显示名，同一作者后续消息沿用
-• <code>${commandName} t "自定义文字"</code> - 组合模式下修改首条所选消息的文字
+<code>${commandName} [数量]</code> 单条 / 连续多条
+<code>${commandName} p 1,3,6</code> 跳选消息
+<code>r</code> 带引用 · <code>n "名字"</code> 改名
+<code>g "标签"</code> 改标签 · <code>t "文字"</code> 改正文
+n / g 作用于首条作者，t 只改首条；<code>g ""</code> 隐藏标签。
 
-<b>组合示例（选项顺序可变）</b>
-• <code>${commandName} 12 r n "新名字"</code>
-• <code>${commandName} p 1,6,8 r n "新名字" t "新的内容"</code>
-数量与 p 二选一；r / n / t 可叠加。带空格或与选项同名的名字/文字请加引号。
+<b>组合示例</b>
+<code>${commandName} p 1,3,6 r n "小王" g "群友"</code>
+数量与 p 二选一，其余可叠加；带空格或与选项同名的内容加引号。
 
-<b>2. 贴纸包管理</b>
-• <code>${commandName} s</code> - 回复图片/贴纸，将其直接保存到你的专属贴纸包
-• <code>${commandName} config sticker &lt;名称&gt;</code> - 设置/修改贴纸包 ShortName
-
-<b>3. API 设置</b>
-• <code>${commandName} api [URL]</code> - 设置自定义后端 Quote API
-• <code>${commandName} api reset</code> - 重置为默认后端 API
-
-默认文字语录使用深紫渐变玻璃气泡（圆角、细描边、顶部高光）。
-自动带上发送者在当前群的成员标签；四周留白更宽，高光保持原样。
-图片和引用缩略图在本地合成，保留同样的玻璃气泡和无框群标签。
-视频、GIF 和动态贴纸在语录中使用静态预览；s 保存模式保留原贴纸。
-自定义 API 需支持 glass 样式。
+<b>单独使用</b>
+<code>${commandName} s</code> 保存图片 / 贴纸
+<code>${commandName} config sticker 名称</code> 设置贴纸包
+<code>${commandName} api URL|reset</code> 设置 / 重置接口
 `;
 
 /**
@@ -964,7 +956,7 @@ async function uploadQuoteStickerImage(client: any, source: Buffer): Promise<any
 
 class YvluPlugin extends Plugin {
   // 设置插件帮助描述（会被核心管理器抓取显示）
-  description: string = `\n生成文字语录贴纸\n\n${help_text}`;
+  description: string = help_text;
   private config: YvluConfig | null = null;
   private configPath: string = "";
 
@@ -1191,6 +1183,7 @@ class YvluPlugin extends Plugin {
       let valid = false;
       let customText: string | undefined;
       let customName: string | undefined;
+      let customTag: string | undefined;
 
       // ================= 路由控制 =================
       // 1. 配置管理路由
@@ -1218,7 +1211,7 @@ class YvluPlugin extends Plugin {
       // ================= 语录生成解析 =================
       try {
         const parsed = parseQuoteOptions(msg.message.replace(/^\s*\S+\s*/, ""));
-        ({ count, pickPositions, r, customText, customName } = parsed);
+        ({ count, pickPositions, r, customText, customName, customTag } = parsed);
         valid = true;
       } catch (error) {
         await msg.edit({ text: `❌ ${error instanceof Error ? error.message : "选项无效"}` });
@@ -1249,7 +1242,7 @@ class YvluPlugin extends Plugin {
           const items = [] as any[];
           const participantCache = new Map<string, Promise<any>>();
           let previousUserIdentifier: string | null = null;
-          let renamedSenderIdentifier: string | null = null;
+          let firstSenderIdentifier: string | null = null;
 
           for await (const [i, message] of messages.entries()) {
             // 获取发送者信息
@@ -1302,8 +1295,8 @@ class YvluPlugin extends Plugin {
 
             // 根据前序用户标识决定是否连通气泡（不在气泡旁绘制头像）
             const currentUserIdentifier = userId || hashCode(name || `${firstName}|${lastName}` || `user_${i}`).toString();
-            if (i === 0) renamedSenderIdentifier = currentUserIdentifier;
-            if (customName !== undefined && currentUserIdentifier === renamedSenderIdentifier) {
+            if (i === 0) firstSenderIdentifier = currentUserIdentifier;
+            if (customName !== undefined && currentUserIdentifier === firstSenderIdentifier) {
               name = customName; firstName = customName; lastName = "";
             }
             const shouldShowAvatar = currentUserIdentifier !== previousUserIdentifier;
@@ -1421,7 +1414,9 @@ class YvluPlugin extends Plugin {
             const media = await getQuoteMediaPreview(message);
 
             items.push({
-              ...(shouldShowAvatar ? await getQuoteSenderTag(message, sender, client, participantCache) : {}),
+              ...(shouldShowAvatar ? customTag !== undefined && currentUserIdentifier === firstSenderIdentifier
+                ? { senderTag: customTag, senderTagRole: "member" }
+                : await getQuoteSenderTag(message, sender, client, participantCache) : {}),
               from: {
                 id: userId ? parseInt(userId) : hashCode(sender.name || `${firstName}|${lastName}`),
                 name: shouldShowAvatar ? name : "",
