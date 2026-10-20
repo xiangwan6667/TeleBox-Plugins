@@ -330,6 +330,9 @@ const help_text = `
 <b>3. API 设置</b>
 • <code>${commandName} api [URL]</code> - 设置自定义后端 Quote API
 • <code>${commandName} api reset</code> - 重置为默认后端 API
+
+默认文字语录使用深紫渐变玻璃气泡（圆角、细描边、顶部高光）。
+带媒体的语录仍使用原增强版 API；自定义 API 需支持 glass 样式。
 `;
 
 /**
@@ -398,13 +401,63 @@ interface YvluConfig {
   _comment?: string;
 }
 
-// 通过 Base64 解码隐蔽地存储默认 API 路径，增加一定安全性
-const DEFAULT_API_URL = JSON.parse(
-  Buffer.from(
-    "eyJ1cmwiOiJodHRwczovL3F1b3RlLWFwaS1lbmhhbmNlZC56aGV0ZW5nc2hhLmV1Lm9yZy9nZW5lcmF0ZS53ZWJwIn0=",
-    "base64"
-  ).toString("utf-8")
-).url;
+// 新版 Quote API 原生绘制 glass 气泡；媒体保留原增强版渲染路径。
+const DEFAULT_API_URL = "https://quote.yuri.ly/generate.webp";
+const MEDIA_API_URL = "https://quote-api-enhanced.zhetengsha.eu.org/generate.webp";
+const QUOTE_APPEARANCE = {
+  style: "glass",
+  backgroundColor: "#302737/#221d2a",
+};
+
+/** 新版 API 只接受远程头像 URL；用本地已下载的头像替换它绘制的圆形占位头像。 */
+async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buffer> {
+  const groups = messages.filter(message => message.avatar);
+  if (!groups.some(message => message.from.photo?.url?.startsWith("data:"))) return buffer;
+  const sharp = (await import("sharp")).default;
+  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { width, height } = info;
+  const visited = new Uint8Array(width * height);
+  const circles: { left: number; top: number; right: number; bottom: number }[] = [];
+  // 头像独占最左侧一列。沿 alpha 连通区域寻找圆形，不依赖文字长度或缩放比例。
+  for (let y = 0; y < height; y++) {
+    const seed = y * width;
+    if (visited[seed] || data[seed * 4 + 3] < 128) continue;
+    const queue = [seed];
+    visited[seed] = 1;
+    let left = 0, right = 0, top = y, bottom = y;
+    for (let i = 0; i < queue.length; i++) {
+      const pixel = queue[i], px = pixel % width, py = Math.floor(pixel / width);
+      right = Math.max(right, px); top = Math.min(top, py); bottom = Math.max(bottom, py);
+      const neighbors = [px > 0 ? pixel - 1 : -1, px + 1 < width ? pixel + 1 : -1, py > 0 ? pixel - width : -1, py + 1 < height ? pixel + width : -1];
+      for (const next of neighbors) {
+        if (next >= 0 && !visited[next] && data[next * 4 + 3] >= 128) {
+          visited[next] = 1;
+          queue.push(next);
+        }
+      }
+    }
+    const w = right - left + 1, h = bottom - top + 1;
+    if (w >= 8 && Math.abs(w - h) <= 3 && w < width / 2) circles.push({ left, right, top, bottom });
+  }
+  if (circles.length !== groups.length) {
+    console.warn("[yvlux] 头像布局未匹配，保留 API 返回的头像");
+    return buffer;
+  }
+  for (const [index, circle] of circles.entries()) {
+    const photo = /^data:image\/[\w.+-]+;base64,(.+)$/i.exec(groups[index].from.photo?.url || "");
+    if (!photo) continue;
+    const w = circle.right - circle.left + 1, h = circle.bottom - circle.top + 1;
+    const avatar = await sharp(Buffer.from(photo[1], "base64")).resize(w, h, { fit: "cover" }).ensureAlpha().raw().toBuffer();
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const target = ((circle.top + y) * width + circle.left + x) * 4, source = (y * w + x) * 4;
+        avatar.copy(data, target, source, source + 3);
+        data[target + 3] = Math.round(data[target + 3] * avatar[source + 3] / 255);
+      }
+    }
+  }
+  return sharp(data, { raw: { width, height, channels: 4 } }).webp({ lossless: true }).toBuffer();
+}
 
 
 class YvluPlugin extends Plugin {
@@ -477,13 +530,43 @@ class YvluPlugin extends Plugin {
     try {
       let url = this.config?.apiUrl;
       // 检查当前配置中是否有自定义地址，没有则使用默认
-      if (!url || !url.trim()) url = DEFAULT_API_URL;
+      if (!url || !url.trim()) {
+        url = quoteData.messages.some((message: any) => message.media) ? MEDIA_API_URL : DEFAULT_API_URL;
+      }
+
+      let data = quoteData;
+      if (url === DEFAULT_API_URL) {
+        // glass 把同一人的头像移到末条气泡；为后续气泡补齐发送者资料。
+        // name=false 隐藏重复昵称，同时保留无头像时生成首字母所需的名字。
+        let groupFrom: any;
+        data = {
+          ...quoteData,
+          messages: quoteData.messages.map((message: any) => {
+            if (!groupFrom || groupFrom.id !== message.from.id || message.avatar) {
+              groupFrom = message.from;
+            }
+            if (message.avatar) return { ...message, from: { ...message.from, photo: undefined } };
+            return {
+              ...message,
+              from: {
+                ...groupFrom,
+                ...message.from,
+                name: false,
+                first_name: groupFrom.first_name || groupFrom.name,
+                last_name: groupFrom.last_name,
+                photo: undefined,
+                username: groupFrom.username,
+              },
+            };
+          }),
+        };
+      }
 
       const response = await axios({
         method: "post",
         timeout,
         url: url,
-        data: quoteData,
+        data,
         responseType: "arraybuffer",
         headers: {
           "Content-Type": "application/json",
@@ -492,8 +575,14 @@ class YvluPlugin extends Plugin {
       });
 
       console.log("quote-api响应状态:", response.status);
-      // 返回的永远视为 webp，如果是动图，内部实际会是 webm
-      return { buffer: response.data, ext: "webp" };
+      let buffer = Buffer.from(response.data);
+      // 新版 API 对很长的语录可能返回 PNG，不能继续按 WebP 尺寸解析。
+      if (buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+        const sharp = (await import("sharp")).default;
+        buffer = await sharp(buffer).resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
+      }
+      if (url === DEFAULT_API_URL) buffer = await restoreGlassAvatars(buffer, quoteData.messages);
+      return { buffer, ext: "webp" };
     } catch (error) {
       if (axios.isAxiosError(error)) {
         console.error(`quote-api请求失败:`, {
@@ -836,6 +925,8 @@ class YvluPlugin extends Plugin {
                 username: photo && shouldShowAvatar ? username || undefined : undefined,
                 photo,
                 emoji_status: shouldShowAvatar ? emojiStatus || undefined : undefined,
+                // 保留 Telegram 的昵称强调色，不把所有人的昵称强制改成同一种颜色。
+                accentColorId: (sender as any).color?.color,
               },
               text: message.message || "",
               entities: entities,
@@ -849,7 +940,7 @@ class YvluPlugin extends Plugin {
           const quoteData = {
             type: "quote",
             format: "webp", // 强行指定后端生成 webp（包含 webm 帧容器）
-            backgroundColor: "#1b1429",
+            ...QUOTE_APPEARANCE,
             width: 512,
             height: 768,
             scale: 2,
