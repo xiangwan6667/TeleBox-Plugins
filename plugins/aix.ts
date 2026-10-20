@@ -5354,10 +5354,11 @@ class ImageFeature extends BaseFeatureHandler {
   }
 
 
-  private detectSourceLock(args: string[], forceAvatar: boolean): "avatar" | "sticker" | "image" | null {
+  private detectSourceLock(args: string[], forceAvatar: boolean): "avatar" | "dual-avatar" | "sticker" | "image" | null {
     if (forceAvatar) return "avatar";
     const tokens = args.slice(1).filter(Boolean);
     const first = tokens[0]?.toLowerCase();
+    if (first === "aa") return "dual-avatar";
     if (first === "a") return "avatar";
     if (["avatar", "头像", "頭像"].includes(first || "")) return "avatar";
     if (["sticker", "贴纸", "貼紙"].includes(first || "")) return "sticker";
@@ -5370,7 +5371,7 @@ class ImageFeature extends BaseFeatureHandler {
     if (!tokens.length) return [];
     const first = tokens[0]?.toLowerCase();
     if (forceAvatar) return tokens;
-    if (["a", "avatar", "头像", "頭像", "sticker", "贴纸", "貼紙", "image", "img", "图片", "圖片"].includes(first || "")) {
+    if (["a", "aa", "avatar", "头像", "頭像", "sticker", "贴纸", "貼紙", "image", "img", "图片", "圖片"].includes(first || "")) {
       return tokens.slice(1);
     }
     return tokens;
@@ -5479,15 +5480,29 @@ class ImageFeature extends BaseFeatureHandler {
     const optimizePrompt = optimizeParsed.optimizePrompt || config.promptOptimize !== false;
     const imageCount = imageRequest.count;
     const wantsAvatar = sourceLock === "avatar";
+    const wantsDualAvatars = sourceLock === "dual-avatar";
+    const withAvatarReferences = (value: string): string => wantsDualAvatars
+      ? `${value}\n\n参考图顺序：第一张（IMAGE A）是被回复者的头像，第二张（IMAGE B）是发送这条生图命令的人的头像。请同时参考这两个头像，保留各自的核心外观特征，按用户要求生成画面，不要混淆或遗漏其中一方。`
+      : value;
+
+    requireUser(!wantsDualAvatars || !!replyMsg, "双头像模式需要回复一条消息，例如 .aix image aa 两个人一起喝茶");
     
-    let replyImageParts = await getMessageImageParts(replyMsg);
+    let replyImageParts = wantsDualAvatars ? [] : await getMessageImageParts(replyMsg);
     const messageImageParts = await getMessageImageParts(msg);
     let imageParts = [...replyImageParts, ...messageImageParts];
     const originalReplyImageParts = [...replyImageParts];
     const originalImageParts = [...imageParts];
 
 
-    if (sourceLock === "avatar") {
+    if (wantsDualAvatars) {
+      const [replyAvatar, senderAvatar] = await Promise.all([
+        getAvatarImagePartFromMessageSender(replyMsg),
+        getAvatarImagePartFromMessageSender(msg),
+      ]);
+      requireUser(!!replyAvatar, "无法获取被回复者的头像，请确认对方有可访问的头像");
+      requireUser(!!senderAvatar, "无法获取命令发送者的头像，请确认发送者有可访问的头像");
+      imageParts = [replyAvatar!, senderAvatar!, ...messageImageParts];
+    } else if (sourceLock === "avatar") {
       imageParts = [];
       replyImageParts = [];
       const avatarPart = await this.getReplyAvatarImagePart(replyMsg);
@@ -5593,7 +5608,7 @@ class ImageFeature extends BaseFeatureHandler {
             const basePrompt = `${explicitPrompt}\n\n第${i + 1}张必须和其他图片明显不同；如果是表情包加字，这一张必须直接写出自己专属的画面文字，不能和其他张重复。`;
             const optimized = await runPromptOptimizationWithTimeout(
               this.aiService,
-              buildImagePromptOptimizationRequest(basePrompt, config.promptLength, config.imagePromptRules),
+              buildImagePromptOptimizationRequest(withAvatarReferences(basePrompt), config.promptLength, config.imagePromptRules),
               imageParts,
               token,
               Math.max((config.timeout || 30), 20) * 1000,
@@ -5616,7 +5631,7 @@ class ImageFeature extends BaseFeatureHandler {
         } else {
           const optimized = await runPromptOptimizationWithTimeout(
             this.aiService,
-            buildImagePromptOptimizationRequest(originalPrompt, config.promptLength, config.imagePromptRules),
+            buildImagePromptOptimizationRequest(withAvatarReferences(originalPrompt), config.promptLength, config.imagePromptRules),
             imageParts,
             token,
             Math.max((config.timeout || 30), 20) * 1000,
@@ -5677,7 +5692,7 @@ class ImageFeature extends BaseFeatureHandler {
           const singlePrompt = perImagePrompts[i] || normalizeSingleImagePrompt(prompt, i, imageCount);
           for (let attempt = 1; attempt <= 2; attempt++) {
             try {
-              const batch = await this.aiService.editImage(singlePrompt, inputImage, token);
+              const batch = await this.aiService.editImage(withAvatarReferences(singlePrompt), inputImage, token);
               images.push(...batch);
               break;
             } catch (error: any) {
@@ -5728,7 +5743,7 @@ class ImageFeature extends BaseFeatureHandler {
             token.throwIfAborted();
             try {
               const singlePrompt = normalizeSingleImagePrompt(originalPrompt, i, imageCount);
-              const batch = await this.aiService.editImage(singlePrompt, fallbackInputImage, token);
+              const batch = await this.aiService.editImage(withAvatarReferences(singlePrompt), fallbackInputImage, token);
               images.push(...batch);
             } catch {}
             if (i < imageCount - 1) await sleep(3500, token);
@@ -6166,10 +6181,13 @@ class AIXPlugin extends Plugin {
 • <code>${mainPrefix}aix search prompt</code> - 联网搜索并回答
 • <code>${mainPrefix}aix image prompt</code> - 生图/回复改图/多图结合
 • <code>${mainPrefix}aix image 2 prompt</code> - 生成2张图片
+• <code>${mainPrefix}aix image aa prompt</code> - 同时参考被回复者与命令发送者的头像
+• <code>${mainPrefix}aix image aa 2 prompt</code> - 双头像生成2张图片
 • <code>${mainPrefix}aix video prompt</code> - 文生/参考图生成视频
 • <code>${mainPrefix}aix video first prompt</code> - 首帧生成视频
 • <code>${mainPrefix}aix video firstlast prompt</code> - 首尾帧生成视频
 • <code>a</code> - 用于识别回复目标头像
+• <code>aa</code> - 需要回复消息；IMAGE A 为被回复者头像，IMAGE B 为命令发送者头像，可再附带最多4张图片
 • 多图结合：一次发送多张图片，或回复图片后附带其他图片
 • 发送图片时，命令和 prompt 必须写在图片下方的说明中
 • 例如：<code>${mainPrefix}aix image 2 prompt</code> / <code>${mainPrefix}aix image a prompt</code> / <code>${mainPrefix}aix image a 2 prompt</code>
