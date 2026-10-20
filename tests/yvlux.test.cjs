@@ -80,7 +80,7 @@ const mockRequire = name => {
   if (name === '@utils/tlRevive') return {reviveEntities: e => e};
   return require(name);
 };
-vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;exports._clearHeaders=()=>quoteHeaderCache.clear();exports._center=centerQuoteArtwork;', {
+vm.runInNewContext(compiled.outputText + '\nexports._expand = expandGlassPadding; exports._tag = getQuoteSenderTag; exports._restore = restoreGlassAvatars;exports._headers = renderQuoteHeaders;exports._parse = parseQuoteOptions;exports._split = splitQuoteMessages;exports._fetch = fetchQuoteMessages;exports._preview=getQuoteMediaPreview;exports._upload=uploadQuoteStickerImage;exports._body=quoteBodyText;exports._clearHeaders=()=>quoteHeaderCache.clear();exports._fit=fitQuoteArtwork;', {
   require: mockRequire, exports: exportsObj, Buffer, console: {log() {}, warn() {}, error() {}},
 });
 const plugin = exportsObj.default;
@@ -95,10 +95,10 @@ async function artworkBounds(buffer) {
   for(let y=0;y<info.height;y++)for(let x=0;x<info.width;x++)if(data[(y*info.width+x)*4+3]){left=Math.min(left,x);right=Math.max(right,x);top=Math.min(top,y);bottom=Math.max(bottom,y);}
   return {data,info,left,right,top,bottom};
 }
-async function assertCentered(buffer) {
+async function assertTightArtwork(buffer) {
   const bounds=await artworkBounds(buffer);
-  assert.ok(Math.abs(bounds.left-(bounds.info.width-1-bounds.right))<=1,'whole artwork has equal left and right transparent margins');
-  assert.ok(Math.abs(bounds.top-(bounds.info.height-1-bounds.bottom))<=1,'whole artwork has equal top and bottom transparent margins');
+  assert.ok(bounds.left<=1 && bounds.info.width-1-bounds.right<=1,'artwork fills its actual width without transparent side margins');
+  assert.ok(bounds.top<=1 && bounds.info.height-1-bounds.bottom<=1,'artwork fills its actual height without transparent top/bottom margins');
   return bounds;
 }
 async function run(command, messages, extra = {}, expectedImages = 1) {
@@ -118,7 +118,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(quoteRequests[0].data.style, 'glass');
   assert.equal(quoteRequests[0].data.backgroundColor, '#302737/#221d2a');
   assert.equal(sent[0].replyTo, messages[0].id);
-  for(const file of sent)await assertCentered(file.bytes);
+  for(const file of sent)await assertTightArtwork(file.bytes);
   return quoteRequests[0];
 }
 (async () => {
@@ -188,11 +188,13 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   const restoredPixels=await sharp(realAvatar).ensureAlpha().raw().toBuffer();
   assert.deepEqual(pixel(restoredPixels,25,105),[137,171,204,255],'local avatar replaces API placeholder');
   for(let i=3;i<afterPixels.length;i+=4)assert.equal(restoredPixels[i],afterPixels[i],'avatar restoration preserves alpha and glass translucency');
-  const centeredOnly=await exportsObj._center(realAvatar);
-  const centeredBounds=await assertCentered(centeredOnly);
-  assert.equal(centeredBounds.info.width,512);assert.equal(centeredBounds.info.height,240,'centering keeps the original canvas size');
-  const enlarged=await exportsObj._center(realAvatar,[{avatar:true,from:{photo:{url:'data:image/png;base64,'+avatarImage.toString('base64')}}}]);
-  const enlargedBounds=await assertCentered(enlarged);
+  const fittedOnly=await exportsObj._fit(realAvatar);
+  const fittedBounds=await assertTightArtwork(fittedOnly);
+  const originalBounds=await artworkBounds(realAvatar);
+  assert.equal(fittedBounds.info.width,originalBounds.right-originalBounds.left+1);
+  assert.equal(fittedBounds.info.height,originalBounds.bottom-originalBounds.top+1,'canvas matches artwork bounds instead of retaining empty space');
+  const enlarged=await exportsObj._fit(realAvatar,[{avatar:true,from:{photo:{url:'data:image/png;base64,'+avatarImage.toString('base64')}}}]);
+  const enlargedBounds=await assertTightArtwork(enlarged);
   let avatarLeft=enlargedBounds.info.width,avatarRight=-1;
   for(let i=0;i<enlargedBounds.data.length;i+=4)if(enlargedBounds.data[i]===137&&enlargedBounds.data[i+1]===171&&enlargedBounds.data[i+2]===204&&enlargedBounds.data[i+3]>128){const x=(i/4)%enlargedBounds.info.width;avatarLeft=Math.min(avatarLeft,x);avatarRight=Math.max(avatarRight,x);}
   assert.ok(avatarRight-avatarLeft+1>=57&&avatarRight-avatarLeft+1<=59,'50px avatar grows to about 58px without enlarging the bubble');
@@ -316,8 +318,8 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.ok(individual.every(request=>request.data.messages.length===1&&request.data.messages[0].avatar),'each retry has a single known message and layout');
   assert.equal(individual[1].data.messages[0].from.first_name,'Author A','continuation restores complete sender metadata');
   const fallbackPixels=await sharp(fallback.buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
-  const fallbackBounds=await assertCentered(fallback.buffer);
-  assert.equal(Math.max(fallbackPixels.info.width,fallbackPixels.info.height),512);
+  const fallbackBounds=await assertTightArtwork(fallback.buffer);
+  assert.ok(Math.max(fallbackPixels.info.width,fallbackPixels.info.height)<=512);
   let avatarBands=0,avatarInBand=false;
   for(let y=0;y<fallbackPixels.info.height;y++) {
     const alpha=fallbackPixels.data[(y*fallbackPixels.info.width+fallbackBounds.left+15)*4+3];
@@ -331,7 +333,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     omitAvatars=false;joinBubbles=false;
     assert.equal(requests.filter(request=>request.data.type==='png'&&request.data.style==='glass').length,3,`${fault} also takes the structured retry`);
     const recoveredMeta=await sharp(recovered.buffer).metadata();
-    assert.equal(Math.max(recoveredMeta.width,recoveredMeta.height),512);
+    assert.ok(Math.max(recoveredMeta.width,recoveredMeta.height)<=512);
   }
   console.log('PASS: pure emoji/empty-message normalization; incomplete backend layout retries preserve every message, header/tag alignment, uniform scale, and grouped avatars.');
   const tagLive=process.argv.includes('--tag-live');

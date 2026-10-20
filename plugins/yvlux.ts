@@ -902,8 +902,8 @@ async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buf
   return sharp(data, { raw: { width, height, channels: 4 } }).webp({ lossless: true }).toBuffer();
 }
 
-/** 末步统一放大头像并居中；尽量复用透明留白，保持正文和气泡的大小。 */
-async function centerQuoteArtwork(buffer: Buffer, messages: any[] = []): Promise<Buffer> {
+/** 末步放大头像并按内容裁边，不用透明空画布撑大或居中贴纸。 */
+async function fitQuoteArtwork(buffer: Buffer, messages: any[] = []): Promise<Buffer> {
   const sharp = (await import("sharp")).default;
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   let left = info.width, top = info.height, right = -1, bottom = -1;
@@ -939,17 +939,14 @@ async function centerQuoteArtwork(buffer: Buffer, messages: any[] = []): Promise
     }
   }
   const width = right - left + 1 + extraLeft, height = bottom - top + 1 + extraTop;
-  const canvasWidth = Math.max(info.width, width), canvasHeight = Math.max(info.height, height);
-  const targetLeft = Math.floor((canvasWidth - width) / 2), targetTop = Math.floor((canvasHeight - height) / 2);
-  if (!resizeAvatars && left === targetLeft && top === targetTop) return buffer;
   const artwork = await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } })
     .extract({ left, top, width: right - left + 1, height: bottom - top + 1 }).png().toBuffer();
-  const centered = await sharp({ create: { width: canvasWidth, height: canvasHeight, channels: 4, background: "#00000000" } })
+  const fitted = await sharp({ create: { width, height, channels: 4, background: "#00000000" } })
     .composite([
-      { input: artwork, left: targetLeft + extraLeft, top: targetTop + extraTop },
-      ...avatars.map(avatar => ({ ...avatar, left: targetLeft + avatar.left, top: targetTop + extraTop + avatar.top })),
+      { input: artwork, left: extraLeft, top: extraTop },
+      ...avatars.map(avatar => ({ ...avatar, top: extraTop + avatar.top })),
     ]).png().toBuffer();
-  return sharp(centered).resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
+  return sharp(fitted).resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
 }
 
 /** 语录中的媒体统一为本地预览，避免旧媒体接口绕过玻璃、全名和群标签处理。 */
@@ -1215,8 +1212,8 @@ class YvluPlugin extends Plugin {
           console.warn(`[yvlux] 整图布局异常，改为逐条渲染后合成: ${error.message}`);
           buffer = await this.renderQuoteRows(quoteData, data, headers);
         }
-        // 头像替换和异常恢复都完成后再居中，中间识别仍使用原来的坐标。
-        buffer = await centerQuoteArtwork(buffer, quoteData.messages);
+        // 头像替换和异常恢复完成后裁掉外部透明空白，中间识别仍使用原来的坐标。
+        buffer = await fitQuoteArtwork(buffer, quoteData.messages);
       }
       return { buffer, ext: "webp" };
     } catch (error) {
