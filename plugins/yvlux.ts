@@ -299,12 +299,10 @@ const mainPrefix = prefixes[0];
 const pluginName = "yvlux";
 const commandName = `${mainPrefix}${pluginName}`;
 
-const MAX_PICK_POSITION = 100;
 function parsePickPositions(value: string): number[] {
-  if (!/^\d+(?:[,，]\d+)*$/.test(value)) throw new Error("用法：.yvlux pick 1,6,8（序号之间用逗号，不加空格）");
+  if (!/^\d+(?:[,，]\d+)*$/.test(value)) throw new Error(`用法：${commandName} p 1,6,8（序号之间用逗号，不加空格）`);
   const positions = [...new Set(value.split(/[,，]/).map(Number))].sort((a, b) => a - b);
-  if (positions.some(n => !Number.isSafeInteger(n) || n < 1 || n > MAX_PICK_POSITION)) throw new Error("消息序号必须是 1–100 的整数");
-  if (positions.length > 5) throw new Error("最多选择 5 条消息");
+  if (positions.some(n => !Number.isSafeInteger(n) || n < 1)) throw new Error("消息序号必须是正整数");
   return positions;
 }
 function selectPickedMessages<T>(messages: T[], positions: number[]): T[] {
@@ -313,15 +311,110 @@ function selectPickedMessages<T>(messages: T[], positions: number[]): T[] {
   return positions.map(n => messages[n - 1]);
 }
 
+function parseQuoteOptions(input: string) {
+  const tokens: { value: string; start: number; quoted: boolean }[] = [];
+  for (let i = 0; i < input.length;) {
+    if (/\s/.test(input[i])) { i++; continue; }
+    const start = i, quote = input[i] === '"' || input[i] === "'" ? input[i++] : "";
+    let value = "", closed = !quote;
+    while (i < input.length) {
+      if (quote && input[i] === quote) { i++; closed = true; break; }
+      if (!quote && /\s/.test(input[i])) break;
+      if (quote && input[i] === "\\" && (input[i + 1] === quote || input[i + 1] === "\\")) i++;
+      value += input[i++];
+    }
+    if (!closed) throw new Error("引号没有闭合");
+    if (quote && i < input.length && !/\s/.test(input[i])) throw new Error("引号后的选项之间需要空格");
+    tokens.push({ value, start, quoted: !!quote });
+  }
+  let count = 1, countSet = false, pickPositions: number[] | undefined, r = false;
+  let customName: string | undefined, customText: string | undefined;
+  const valueAfter = (index: number, mode: string) => {
+    const token = tokens[index + 1];
+    if (!token || !token.value.trim() || (!token.quoted && /^(p|pick|r|n|t|s|config|api)$/i.test(token.value))) throw new Error(`${mode} 后需要提供内容；包含空格或保留字时用引号包住`);
+    return token.value;
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i], mode = token.quoted ? "" : token.value.toLowerCase();
+    if (mode === "p" || mode === "pick") {
+      if (pickPositions || countSet) throw new Error("连续数量和 p 跳选只能选择一种");
+      pickPositions = parsePickPositions(valueAfter(i, "p"));
+      count = pickPositions[pickPositions.length - 1]; i++;
+    } else if (mode === "r") {
+      r = true;
+    } else if (mode === "n") {
+      if (customName !== undefined) throw new Error("n 改名只能设置一次");
+      customName = valueAfter(i, "n"); i++;
+    } else if (mode === "t") {
+      if (customText !== undefined) throw new Error("自定义文字只能设置一次");
+      customText = valueAfter(i, "t"); i++;
+    } else if (!token.quoted && /^[+-]?\d+$/.test(token.value)) {
+      if (countSet || pickPositions) throw new Error("连续数量和 p 跳选只能选择一种");
+      count = Number(token.value); countSet = true;
+      if (!Number.isSafeInteger(count) || count < 1) throw new Error("消息数量必须是正整数");
+    } else if (["s", "config", "api"].includes(mode)) {
+      throw new Error("保存、配置和 API 命令需要单独使用");
+    } else {
+      if (customText !== undefined) throw new Error("自定义文字只能设置一次；组合使用时请用 t \"文字\"");
+      customText = token.quoted && i === tokens.length - 1 ? token.value : input.slice(token.start);
+      break;
+    }
+  }
+  return { count, pickPositions, r, customName, customText };
+}
+
+function splitQuoteMessages(items: any[], perImage = 5): any[][] {
+  const batches: any[][] = [];
+  let batch: any[] = [], profile: any, tag: any, previousId: any;
+  for (const item of items) {
+    if (item.avatar || !profile || item.from.id !== previousId) {
+      profile = item.from; tag = { senderTag: item.senderTag, senderTagRole: item.senderTagRole };
+    }
+    if (batch.length === perImage) { batches.push(batch); batch = []; }
+    // 新一张的首条必须有完整昵称和头像，即使它与上一张末条是同一个人。
+    batch.push(!batch.length && !item.avatar ? { ...item, ...tag, avatar: true, from: { ...profile } } : item);
+    previousId = item.from.id;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+async function fetchQuoteMessages(client: any, replied: any, beforeId: number, needed: number): Promise<any[]> {
+  const found = new Map<number, any>();
+  if (replied.id < beforeId && !(replied instanceof Api.MessageService)) found.set(replied.id, replied);
+  let cursor = replied.id;
+  while (found.size < needed) {
+    const page = await client.getMessages(replied.peerId, {
+      offsetId: cursor, limit: Math.min(100, needed - found.size), reverse: true, maxId: beforeId,
+    });
+    let next = cursor;
+    for (const message of page || []) {
+      if (message.id <= cursor || message.id >= beforeId) continue;
+      next = Math.max(next, message.id);
+      if (!(message instanceof Api.MessageService)) found.set(message.id, message);
+    }
+    if (next <= cursor) break;
+    cursor = next;
+  }
+  return [...found.values()].sort((a, b) => a.id - b.id).slice(0, needed);
+}
+
 // 包含自定义修改后的 Help 文档字符串
 const help_text = `
 <b>🎨 YVLU 语录生成器 (增强版)</b>
 
 <b>1. 生成语录</b>
-• <code>${commandName} [数量]</code> - 回复消息，生成最近 N 条
-• <code>${commandName} pick 1,6,8</code> - 从回复消息起计数，跳选合成（最多 5 条，序号 1–100）
+• <code>${commandName} [数量]</code> - 从回复消息起连续选取，超过 5 条自动分张
+• <code>${commandName} p 1,6,8</code> - 按实际消息序号跳选，无原先 5 条/100 序号限制
 • <code>${commandName} r [数量]</code> - 包含被引用(Reply)的消息进行生成
 • <code>${commandName} &lt;自定义文字&gt;</code> - <b>修改回复消息的内容</b>为自定义文字进行生成
+• <code>${commandName} n "新名字"</code> - 修改首条所选消息作者的显示名，同一作者后续消息沿用
+• <code>${commandName} t "自定义文字"</code> - 组合模式下修改首条所选消息的文字
+
+<b>组合示例（选项顺序可变）</b>
+• <code>${commandName} 12 r n "新名字"</code>
+• <code>${commandName} p 1,6,8 r n "新名字" t "新的内容"</code>
+数量与 p 二选一；r / n / t 可叠加。带空格或与选项同名的名字/文字请加引号。
 
 <b>2. 贴纸包管理</b>
 • <code>${commandName} s</code> - 回复图片/贴纸，将其直接保存到你的专属贴纸包
@@ -418,7 +511,7 @@ async function getQuoteSenderTag(message: any, sender: any, client: any, cache: 
   const directRank = message.fromRank ?? message.from_rank;
   // 新版超级群消息自带 from_rank，直接使用消息上的标签，无需额外查询。
   if (typeof directRank === "string" && directRank.trim()) {
-    return { senderTag: directRank.trim(), senderTagRole: "admin" };
+    return { senderTag: directRank.trim(), senderTagRole: "member" };
   }
   try {
     let participant: any;
@@ -446,16 +539,125 @@ async function getQuoteSenderTag(message: any, sender: any, client: any, cache: 
     const admin = /ParticipantAdmin$/.test(kind);
     const rank = typeof participant?.rank === "string" ? participant.rank.trim() : "";
     const text = rank || (owner ? "群主" : admin ? "管理员" : "");
-    // Quote API 的绿色胶囊预设名为 admin；普通成员标签也用绿色胶囊展示。
-    return text ? { senderTag: text, senderTagRole: owner ? "owner" : "admin" } : {};
+    return text ? { senderTag: text, senderTagRole: "member" } : {};
   } catch {
     // 旧协议或无权查询成员时仍正常生成语录。
     return {};
   }
 }
 
+// 用同一后端绘制短文字片段，再在本地排版，避开后端 300px 标题行的淡出截断。
+// 头像、中文字体、普通及自定义 Emoji 仍由已有渲染路径处理。
+const quoteHeaderCache = new Map<string, Buffer>();
+async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promise<(Buffer | undefined)[]> {
+  const sharp = (await import("sharp")).default;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  const chunks = (text: string) => {
+    const units = Array.from(segmenter.segment(text), item => item.segment);
+    const result: { text: string; space: boolean }[] = [];
+    for (let i = 0; i < units.length; i += 11) {
+      const raw = units.slice(i, i + 11).join("");
+      if (raw.trim()) result.push({ text: raw.trim(), space: i > 0 && /\s/.test(units[i - 1] + units[i]) });
+    }
+    return result;
+  };
+  const entries = messages.map(message => {
+    if (!message.avatar) return undefined;
+    const from = message.from || {};
+    const name = (from.name || [from.first_name, from.last_name].filter(Boolean).join(" ") || from.username || "").replace(/[\r\n\t\u2028\u2029]/g, " ").trim();
+    const tag = (message.senderTag || "").replace(/[\r\n\t\u2028\u2029]/g, " ").trim();
+    const key = JSON.stringify([from.id, name, tag, from.accentColorId, from.emoji_status, emojiBrand]);
+    return { key, name, tag, from };
+  });
+  const missing = new Map<string, any>();
+  const rendered = new Map<string, Buffer>();
+  for (const entry of entries) if (entry && quoteHeaderCache.has(entry.key)) rendered.set(entry.key, quoteHeaderCache.get(entry.key)!);
+  for (const entry of entries) if (entry && !quoteHeaderCache.has(entry.key)) missing.set(entry.key, entry);
+  const rows: any[] = [];
+  for (const entry of missing.values()) {
+    for (const [kind, text] of [["name", entry.name], ["tag", entry.tag]]) {
+      const pieces = chunks(text);
+      for (const [index, piece] of pieces.entries()) rows.push({ entry, kind, ...piece, status: kind === "name" && index === pieces.length - 1 ? entry.from.emoji_status : undefined });
+    }
+  }
+  if (rows.length) {
+    const response = await axios({
+      method: "post", url: DEFAULT_API_URL, timeout, responseType: "arraybuffer",
+      headers: { "Content-Type": "application/json", "User-Agent": "TeleBox/0.2.1" },
+      data: {
+        type: "png", format: "png", style: "classic", backgroundColor: "#00000000",
+        width: 512, height: 768, scale: 2, emojiBrand,
+        messages: rows.map((row, index) => ({
+          chatId: index + 1, avatar: false, text: "", entities: [],
+          // 临时 H 用于定位共同基线，合成前去掉；避免 Emoji/CJK 导致文字高低不齐。
+          from: { id: row.entry.from.id, name: `H ${row.text}`, accentColorId: row.entry.from.accentColorId, emoji_status: row.status },
+        })),
+      },
+    });
+    const sheet = Buffer.from(response.data);
+    const { data, info } = await sharp(sheet).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const bands: { top: number; bottom: number }[] = [];
+    let band: any;
+    for (let y = 0; y < info.height; y++) {
+      let ink = false;
+      for (let x = 0; x < info.width && !ink; x++) ink = data[(y * info.width + x) * 4 + 3] > 8;
+      if (!ink) continue;
+      if (!band || y - band.bottom > 56) { band = { top: y, bottom: y }; bands.push(band); }
+      else band.bottom = y;
+    }
+    if (bands.length !== rows.length) throw new Error("昵称文字渲染不完整，请稍后重试");
+    for (const [index, row] of rows.entries()) {
+      const band = bands[index];
+      const columns = new Uint8Array(info.width);
+      for (let y = band.top; y <= band.bottom; y++) for (let x = 0; x < info.width; x++) {
+        if (data[(y * info.width + x) * 4 + 3] > 8) columns[x] = 1;
+      }
+      const markerLeft = columns.findIndex(Boolean);
+      let markerRight = markerLeft;
+      while (markerRight + 1 < info.width && columns[markerRight + 1]) markerRight++;
+      let left = markerRight + 1, right = info.width - 1, baseline = band.top;
+      while (left < info.width && !columns[left]) left++;
+      while (right >= left && !columns[right]) right--;
+      if (right < left) throw new Error("昵称文字渲染不完整，请稍后重试");
+      for (let y = band.top; y <= band.bottom; y++) for (let x = markerLeft; x <= markerRight; x++) {
+        if (data[(y * info.width + x) * 4 + 3] > 8) baseline = Math.max(baseline, y + 1);
+      }
+      row.baseline = baseline - band.top;
+      row.image = await sharp(sheet).extract({ left, top: band.top, width: right - left + 1, height: band.bottom - band.top + 1 }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+      if (row.kind === "tag") {
+        for (let p = 0; p < row.image.data.length; p += 4) {
+          row.image.data[p] = 180; row.image.data[p + 1] = 171; row.image.data[p + 2] = 191;
+          row.image.data[p + 3] = Math.round(row.image.data[p + 3] * 0.78);
+        }
+      }
+    }
+    for (const entry of missing.values()) {
+      const layers: any[] = [];
+      let x = 0, baseline = 0, below = 0, previousKind = "";
+      for (const row of rows.filter(row => row.entry === entry)) {
+        const factor = (row.kind === "name" ? 20 : 15) / 22;
+        const width = Math.max(1, Math.round(row.image.info.width * factor));
+        const height = Math.max(1, Math.round(row.image.info.height * factor));
+        // 姓名和无框标签始终在同一行；宽度随内容增长，最终整张贴纸统一缩放。
+        if (x) x += row.kind !== previousKind ? 16 : row.space ? 12 : 2;
+        const image = await sharp(row.image.data, { raw: { width: row.image.info.width, height: row.image.info.height, channels: 4 } }).resize(width, height).png().toBuffer();
+        const rowBaseline = Math.round(row.baseline * factor);
+        layers.push({ input: image, left: x, top: 0, baseline: rowBaseline });
+        x += width; baseline = Math.max(baseline, rowBaseline); below = Math.max(below, height - rowBaseline); previousKind = row.kind;
+      }
+      if (!layers.length) continue;
+      const header = await sharp({ create: { width: x, height: baseline + below, channels: 4, background: "#00000000" } })
+        .composite(layers.map(({ baseline: rowBaseline, ...layer }) => ({ ...layer, top: baseline - rowBaseline }))).png().toBuffer();
+      if (quoteHeaderCache.size >= 64) quoteHeaderCache.delete(quoteHeaderCache.keys().next().value);
+      quoteHeaderCache.set(entry.key, header);
+      rendered.set(entry.key, header);
+    }
+  }
+  return entries.map(entry => entry ? rendered.get(entry.key) : undefined);
+}
+
 /** 扩大气泡内边距，复用原文字图层和 glass 高光参数。 */
-async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
+async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[] = []): Promise<Buffer> {
   const sharp = (await import("sharp")).default;
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = info;
@@ -486,18 +688,28 @@ async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
   if (!bubbles.length) return buffer;
   // 按参考图保持紧凑比例：原内边距 16px → 18px，不缩放字形。
   const extra = Math.max(1, Math.round(2 * scale));
-  const outWidth = width + extra * 2, outHeight = height + bubbles.length * extra * 2;
+  if (headers.length && bubbles.length !== headers.length) throw new Error("昵称与气泡布局不一致，请稍后重试");
+  const renderedHeaders = await Promise.all(bubbles.map(async (_, index) => {
+    if (!headers[index]) return undefined;
+    const meta = await sharp(headers[index]).metadata();
+    const w = Math.max(1, Math.round(meta.width! * scale / 2)), h = Math.max(1, Math.round(meta.height! * scale / 2));
+    return { buffer: await sharp(headers[index]).resize(w, h).png().toBuffer(), width: w, height: h };
+  }));
+  const extraHeaderHeight = renderedHeaders.reduce((sum, header) => sum + (header ? header.height + Math.round(12 * scale) : 0), 0);
+  const outWidth = Math.max(width + extra * 2, Math.ceil(112 * scale) + Math.max(0, ...renderedHeaders.map(header => header?.width || 0)));
+  const outHeight = height + bubbles.length * extra * 2 + extraHeaderHeight;
   const layers: any[] = [];
   const finishMasks: any[] = [];
   const finishRegions: any[] = [];
-  let start = 0;
+  let start = 0, offsetY = 0;
   for (const [index, bubble] of bubbles.entries()) {
     const end = index + 1 < bubbles.length ? Math.floor((bubble.bottom + bubbles[index + 1].top) / 2) + 1 : height;
     const bandAvatars = avatars.filter(p => (p.top + p.bottom) / 2 >= start && (p.top + p.bottom) / 2 < end);
     const middle = Math.floor((bubble.top + bubble.bottom) / 2);
     const bodyLeft = Math.min(...bubble.pixels.filter((pixel: number) => Math.floor(pixel / width) === middle).map((pixel: number) => pixel % width));
     const oldW = bubble.right - bodyLeft + 1, oldH = bubble.bottom - bubble.top + 1;
-    const w = oldW + extra * 2, h = oldH + extra * 2, offsetY = index * extra * 2;
+    const header = renderedHeaders[index], headerHeight = header ? header.height + Math.round(12 * scale) : 0;
+    const w = Math.max(oldW + extra * 2, (header?.width || 0) + Math.round(36 * scale)), h = oldH + extra * 2 + headerHeight;
     // 参考图的圆角与正文字号比例约为 1.1，保持饱满且紧凑。
     const radius = Math.min(27 * scale, w / 2, h / 2), grouped = 7 * scale;
     // 相邻气泡原来的小圆角可由边角 alpha 判断，保留同人连续消息的分组形状。
@@ -529,12 +741,14 @@ async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
     const side = Math.round(16 * scale), above = Math.round(12 * scale), below = Math.round(8 * scale);
     const content = { left: bodyLeft + side, top: bubble.top + above, width: oldW - side * 2, height: oldH - above - below };
     if (content.width <= 0 || content.height <= 0) return buffer;
-    layers.push({ input: await sharp(buffer).extract(content).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra });
+    layers.push({ input: await sharp(buffer).extract(content).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra + headerHeight });
+    if (header) layers.push({ input: header.buffer, left: bodyLeft + Math.round(18 * scale), top: bubble.top + offsetY + Math.round(18 * scale) });
     // 头像只移动到底部，大小和内容保持原样。
     for (const avatar of bandAvatars) {
-      layers.push({ input: await sharp(buffer).extract({ left: avatar.left, top: avatar.top, width: avatar.right - avatar.left + 1, height: avatar.bottom - avatar.top + 1 }).png().toBuffer(), left: avatar.left, top: avatar.top + offsetY + extra * 2 });
+      layers.push({ input: await sharp(buffer).extract({ left: avatar.left, top: avatar.top, width: avatar.right - avatar.left + 1, height: avatar.bottom - avatar.top + 1 }).png().toBuffer(), left: avatar.left, top: avatar.top + offsetY + extra * 2 + headerHeight });
     }
     start = end;
+    offsetY += extra * 2 + headerHeight;
   }
   const output = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(layers).raw().toBuffer();
   const finishMask = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(finishMasks).raw().toBuffer();
@@ -544,16 +758,18 @@ async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
         const pixel = (y * outWidth + x) * 4;
         const mask = finishMask[pixel] * finishMask[pixel + 3] / (255 * 255);
         const brightest = Math.max(output[pixel], output[pixel + 1], output[pixel + 2]);
-        // 保留文字、昵称和标签的亮色；背景的变化限制在约 4 个色阶内。
+        // 保留文字、昵称和标签的亮色；背景用宽柔光和轻微透光呈现玻璃层次。
         const weight = mask * Math.max(0, Math.min(1, (86 - brightest) / 26));
         if (!weight) continue;
         const u = (x - region.left) / region.width, v = (y - region.top) / region.height;
-        const softLight = 4 * Math.exp(-Math.pow((u - 0.16) / 0.9, 2) - Math.pow((v - 0.12) / 0.75, 2));
+        const softLight = 9 * Math.exp(-Math.pow((u - 0.18) / 0.8, 2) - Math.pow((v - 0.12) / 0.65, 2))
+          + 2 * Math.exp(-Math.pow((u - 0.86) / 0.45, 2) - Math.pow((v - 0.82) / 0.7, 2));
         // 固定的细颗粒，避免每次生成出现不同强度的噪点。
         const hash = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
-        const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 1.2;
+        const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 0.6;
         const lift = (softLight + grain) * weight;
         for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round(output[pixel + channel] + lift)));
+        output[pixel + 3] = Math.round(output[pixel + 3] * (1 - 0.07 * weight));
       }
     }
   }
@@ -703,7 +919,10 @@ class YvluPlugin extends Plugin {
             if (!groupFrom || groupFrom.id !== message.from.id || message.avatar) {
               groupFrom = message.from;
             }
-            if (message.avatar) return { ...message, from: { ...message.from, photo: undefined } };
+            if (message.avatar) return {
+              ...message, senderTag: undefined,
+              from: { ...message.from, name: false, first_name: message.from.first_name || message.from.name, photo: undefined },
+            };
             return {
               ...message,
               from: {
@@ -720,7 +939,7 @@ class YvluPlugin extends Plugin {
         };
       }
 
-      const response = await axios({
+      const [response, headers] = await Promise.all([axios({
         method: "post",
         timeout,
         url: url,
@@ -730,7 +949,7 @@ class YvluPlugin extends Plugin {
           "Content-Type": "application/json",
           "User-Agent": "TeleBox/0.2.1",
         },
-      });
+      }), url === DEFAULT_API_URL ? renderQuoteHeaders(quoteData.messages, quoteData.emojiBrand) : Promise.resolve([])]);
 
       console.log("quote-api响应状态:", response.status);
       let buffer = Buffer.from(response.data);
@@ -740,7 +959,7 @@ class YvluPlugin extends Plugin {
         buffer = await sharp(buffer).resize({ width: 512, height: 512, fit: "inside" }).webp({ lossless: true }).toBuffer();
       }
       if (url === DEFAULT_API_URL) {
-        buffer = await expandGlassPadding(buffer);
+        buffer = await expandGlassPadding(buffer, headers);
         buffer = await restoreGlassAvatars(buffer, quoteData.messages);
       }
       return { buffer, ext: "webp" };
@@ -761,7 +980,7 @@ class YvluPlugin extends Plugin {
   cmdHandlers: Record<string, (msg: Api.Message, trigger?: Api.Message) => Promise<void>> = {
     yvlux: async (msg: Api.Message, trigger?: Api.Message) => {
       const start = Date.now();
-      const args = msg.message.split(/\s+/);
+      const args = msg.message.trim().split(/\s+/);
       const subCmd = args[1]?.toLowerCase();
 
       let count = 1;
@@ -769,6 +988,7 @@ class YvluPlugin extends Plugin {
       let r = false;
       let valid = false;
       let customText: string | undefined;
+      let customName: string | undefined;
 
       // ================= 路由控制 =================
       // 1. 配置管理路由
@@ -785,34 +1005,22 @@ class YvluPlugin extends Plugin {
 
       // 3. 保存贴纸/图片路由
       if (subCmd === "s") {
+        if (args.length !== 2) { await msg.edit({ text: "s 保存模式请单独使用，不与生成选项组合" }); return; }
         await this.handleSaveStickerToSet(msg);
         return;
       }
+      if (["help", "h", "?"].includes(subCmd)) {
+        await msg.edit({ text: help_text, parseMode: "html" }); return;
+      }
 
       // ================= 语录生成解析 =================
-      if (subCmd === "pick") {
-        try {
-          if (args.length !== 3) throw new Error("用法：.yvlux pick 1,6,8（序号之间用逗号，不加空格）");
-          pickPositions = parsePickPositions(args[2]);
-          count = pickPositions[pickPositions.length - 1];
-          valid = true;
-        } catch (error) {
-          await msg.edit({ text: `❌ ${error instanceof Error ? error.message : "序号无效"}` });
-          return;
-        }
-      } else if (!args[1] || /^\d+$/.test(args[1])) {
-        // 命令：yvlu 或 yvlu 3
-        count = parseInt(args[1]) || 1;
+      try {
+        const parsed = parseQuoteOptions(msg.message.replace(/^\s*\S+\s*/, ""));
+        ({ count, pickPositions, r, customText, customName } = parsed);
         valid = true;
-      } else if (subCmd === "r") {
-        // 命令：yvlu r 3
-        r = true;
-        count = parseInt(args[2]) || 1;
-        valid = true;
-      } else {
-        // 匹配自定义文字 (自定义功能合并：正则剔除了前缀命令，保留剩余所有的字符串片段)
-        customText = msg.message.replace(/^\S+\s+/, "");
-        valid = true;
+      } catch (error) {
+        await msg.edit({ text: `❌ ${error instanceof Error ? error.message : "选项无效"}` });
+        return;
       }
 
       if (valid) {
@@ -821,30 +1029,15 @@ class YvluPlugin extends Plugin {
           await msg.edit({ text: "请回复一条消息" });
           return;
         }
-        if (!pickPositions && count > 5) {
-          await msg.edit({ text: "太多了 哒咩，最多 5 条！" });
-          return;
-        }
-
         await msg.edit({ text: "正在生成语录贴纸..." });
 
+        let sentCount = 0;
         try {
           const client = await getGlobalClient();
 
-          // 逆序抓取目标上下文消息
-          let messages = await client.getMessages(replied.peerId, {
-            offsetId: replied.id - 1,
-            limit: count,
-            reverse: true,
-            ...(pickPositions ? { maxId: msg.id } : {}),
-          });
-          if (pickPositions) {
-            // Count real messages, not arithmetic message IDs; exclude the command.
-            const ordered = Array.from(new Map([replied, ...messages]
-              .filter(m => m.id >= replied!.id && m.id < msg.id && !(m instanceof Api.MessageService))
-              .map(m => [m.id, m])).values()).sort((a, b) => a.id - b.id);
-            messages = selectPickedMessages(ordered, pickPositions) as typeof messages;
-          }
+          // 分页按实际消息计数，跳过服务消息，并始终排除当前命令。
+          const ordered = await fetchQuoteMessages(client, replied, msg.id, count);
+          const messages = pickPositions ? selectPickedMessages(ordered, pickPositions) : ordered;
 
           if (!messages || messages.length === 0) {
             await msg.edit({ text: "未找到消息" });
@@ -854,6 +1047,7 @@ class YvluPlugin extends Plugin {
           const items = [] as any[];
           const participantCache = new Map<string, Promise<any>>();
           let previousUserIdentifier: string | null = null;
+          let renamedSenderIdentifier: string | null = null;
 
           for await (const [i, message] of messages.entries()) {
             // 获取发送者信息
@@ -898,14 +1092,18 @@ class YvluPlugin extends Plugin {
 
             // 组装用户元数据
             const userId = (sender as any).id?.toString();
-            const name = (sender as any).name || "";
-            const firstName = (sender as any).firstName || (sender as any).title || "";
-            const lastName = (sender as any).lastName || "";
+            let name = (sender as any).name || "";
+            let firstName = (sender as any).firstName || (sender as any).title || "";
+            let lastName = (sender as any).lastName || "";
             const username = (sender as any).username || "";
             const emojiStatus = (sender as any).emojiStatus?.documentId?.toString() || null;
 
             // 根据前序用户标识决定是否连通气泡（不在气泡旁绘制头像）
             const currentUserIdentifier = userId || hashCode(name || `${firstName}|${lastName}` || `user_${i}`).toString();
+            if (i === 0) renamedSenderIdentifier = currentUserIdentifier;
+            if (customName !== undefined && currentUserIdentifier === renamedSenderIdentifier) {
+              name = customName; firstName = customName; lastName = "";
+            }
             const shouldShowAvatar = currentUserIdentifier !== previousUserIdentifier;
             previousUserIdentifier = currentUserIdentifier;
 
@@ -931,7 +1129,7 @@ class YvluPlugin extends Plugin {
                 // 如果传入了自定义文字，强行替换文案并清空原本的排版样式（Entities）
                 message.message = customText;
                 message.entities = [];
-              } else if (replyTo?.quoteText) {
+              } else if (replyTo?.quoteText && message.id === replied.id) {
                 // 如果使用了 Telegram 原生部分文字引用功能，覆盖为引用文本
                 message.message = replyTo.quoteText;
                 message.entities = replyTo.quoteEntities;
@@ -1099,96 +1297,101 @@ class YvluPlugin extends Plugin {
             });
           }
 
-          // 核心网络请求数据装配
-          const quoteData = {
-            type: "quote",
-            format: "webp", // 强行指定后端生成 webp（包含 webm 帧容器）
-            ...QUOTE_APPEARANCE,
-            width: 512,
-            height: 768,
-            scale: 2,
-            emojiBrand: "apple", // Emoji 样式设为苹果风
-            messages: items,
-          };
+          const batches = splitQuoteMessages(items);
+          for (const [batchIndex, batch] of batches.entries()) {
+            if (batches.length > 1) await msg.edit({ text: `正在生成语录 ${batchIndex + 1}/${batches.length}（已发送 ${sentCount} 张）...` });
+            // 核心网络请求数据装配
+            const quoteData = {
+              type: "quote",
+              format: "webp", // 强行指定后端生成 webp（包含 webm 帧容器）
+              ...QUOTE_APPEARANCE,
+              width: 512,
+              height: 768,
+              scale: 2,
+              emojiBrand: "apple", // Emoji 样式设为苹果风
+              messages: batch,
+            };
 
-          const quoteResult = await this.generateQuote(quoteData);
-          const imageBuffer = quoteResult.buffer;
-          const imageExt = quoteResult.ext; 
+            const quoteResult = await this.generateQuote(quoteData);
+            const imageBuffer = quoteResult.buffer;
+            const imageExt = quoteResult.ext;
 
-          if (!imageBuffer || imageBuffer.length === 0) {
-            await msg.edit({ text: "生成的图片数据为空" });
-            return;
-          }
-
-          console.log(`[yvlu] API返回: buffer长度=${imageBuffer?.length}, ext=${imageExt}`);
-
-          try {
-            // 解析生成好的 WebP 文件，计算其尺寸以及确认它是否为动态图片(webm/webp animated)
-            const dimensions = getWebPDimensions(imageBuffer);
-            const isWebm = isWebmFormat(imageBuffer);
-            const isAnimated = isAnimatedWebP(imageBuffer);
-
-            console.log(`检测到的图片尺寸: ${dimensions.width}x${dimensions.height}, 格式: ${isWebm ? "webm" : "webp"}, 动态: ${isWebm || isAnimated}`);
-
-            // 【BUG 修复】：摒弃 CustomFile，无论动态静态，统一使用操作系统临时文件路径传递，底层 fs 流能完美解析
-            const os = await import("os");
-            const tmpDir = os.tmpdir();
-            const uniqueId = Date.now().toString();
-
-            if (isWebm) {
-              const webmPath = path.join(tmpDir, `sticker_${uniqueId}.webm`);
-
-              try {
-                fs.writeFileSync(webmPath, imageBuffer);
-                // 必须走文件路径上传，Telegram Client 针对 WebM 贴纸有特殊的二进制封装要求
-                await client.sendFile(msg.peerId, {
-                  file: webmPath,
-                  attributes: [
-                    new Api.DocumentAttributeSticker({
-                      alt: "📝",
-                      stickerset: new Api.InputStickerSetEmpty(),
-                    }),
-                  ],
-                  replyTo: replied?.id,
-                });
-                console.log("[yvlu] 动态贴纸发送成功 (webm)");
-              } finally {
-                try { fs.unlinkSync(webmPath); } catch (e) {}
-              }
-            } else {
-              const staticPath = path.join(tmpDir, `sticker_${uniqueId}.${imageExt}`);
-              
-              try {
-                fs.writeFileSync(staticPath, imageBuffer);
-
-                const stickerAttr = new Api.DocumentAttributeSticker({
-                  alt: "📝",
-                  stickerset: new Api.InputStickerSetEmpty(),
-                });
-                const imageSizeAttr = new Api.DocumentAttributeImageSize({
-                  w: dimensions.width,
-                  h: dimensions.height,
-                });
-                const filenameAttr = new Api.DocumentAttributeFilename({
-                  fileName: `sticker.${imageExt}`,
-                });
-
-                await client.sendFile(msg.peerId, {
-                  file: staticPath, // 直接传入 String 文件路径
-                  forceDocument: false, 
-                  attributes: [stickerAttr, imageSizeAttr, filenameAttr],
-                  replyTo: replied?.id,
-                });
-
-                console.log("[yvlu] 静态贴纸发送成功");
-              } finally {
-                try { fs.unlinkSync(staticPath); } catch (e) {}
-              }
+            if (!imageBuffer || imageBuffer.length === 0) {
+              await msg.edit({ text: "生成的图片数据为空" });
+              return;
             }
-          } catch (fileError) {
-            console.error(`发送文件失败: ${fileError}`);
-            await msg.edit({ text: `发送文件失败: ${fileError}` });
-            return;
+
+            console.log(`[yvlu] API返回: buffer长度=${imageBuffer?.length}, ext=${imageExt}`);
+
+            try {
+              // 解析生成好的 WebP 文件，计算其尺寸以及确认它是否为动态图片(webm/webp animated)
+              const dimensions = getWebPDimensions(imageBuffer);
+              const isWebm = isWebmFormat(imageBuffer);
+              const isAnimated = isAnimatedWebP(imageBuffer);
+
+              console.log(`检测到的图片尺寸: ${dimensions.width}x${dimensions.height}, 格式: ${isWebm ? "webm" : "webp"}, 动态: ${isWebm || isAnimated}`);
+
+              // 【BUG 修复】：摒弃 CustomFile，无论动态静态，统一使用操作系统临时文件路径传递，底层 fs 流能完美解析
+              const os = await import("os");
+              const tmpDir = os.tmpdir();
+              const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+              if (isWebm) {
+                const webmPath = path.join(tmpDir, `sticker_${uniqueId}.webm`);
+
+                try {
+                  fs.writeFileSync(webmPath, imageBuffer);
+                  // 必须走文件路径上传，Telegram Client 针对 WebM 贴纸有特殊的二进制封装要求
+                  await client.sendFile(msg.peerId, {
+                    file: webmPath,
+                    attributes: [
+                      new Api.DocumentAttributeSticker({
+                        alt: "📝",
+                        stickerset: new Api.InputStickerSetEmpty(),
+                      }),
+                    ],
+                    replyTo: replied?.id,
+                  });
+                  console.log("[yvlu] 动态贴纸发送成功 (webm)");
+                } finally {
+                  try { fs.unlinkSync(webmPath); } catch (e) {}
+                }
+              } else {
+                const staticPath = path.join(tmpDir, `sticker_${uniqueId}.${imageExt}`);
+              
+                try {
+                  fs.writeFileSync(staticPath, imageBuffer);
+
+                  const stickerAttr = new Api.DocumentAttributeSticker({
+                    alt: "📝",
+                    stickerset: new Api.InputStickerSetEmpty(),
+                  });
+                  const imageSizeAttr = new Api.DocumentAttributeImageSize({
+                    w: dimensions.width,
+                    h: dimensions.height,
+                  });
+                  const filenameAttr = new Api.DocumentAttributeFilename({
+                    fileName: `sticker.${imageExt}`,
+                  });
+
+                  await client.sendFile(msg.peerId, {
+                    file: staticPath, // 直接传入 String 文件路径
+                    forceDocument: false,
+                    attributes: [stickerAttr, imageSizeAttr, filenameAttr],
+                    replyTo: replied?.id,
+                  });
+
+                  console.log("[yvlu] 静态贴纸发送成功");
+                } finally {
+                  try { fs.unlinkSync(staticPath); } catch (e) {}
+                }
+              }
+            } catch (fileError) {
+              console.error(`发送文件失败: ${fileError}`);
+              await msg.edit({ text: `第 ${batchIndex + 1} 张发送失败（已发送 ${sentCount} 张）: ${fileError}` });
+              return;
+            }
+            sentCount++;
           }
 
           // 生成和发送完成：显式 revoke，确保命令对所有聊天成员撤回。
@@ -1198,7 +1401,7 @@ class YvluPlugin extends Plugin {
           console.log(`语录生成耗时: ${end - start}ms`);
         } catch (error) {
           console.error(`语录生成失败: ${error}`);
-          await msg.edit({ text: `语录生成失败: ${error}` });
+          await msg.edit({ text: `语录生成失败${sentCount ? `（已发送 ${sentCount} 张）` : ""}: ${error}` });
         }
       } else {
         // 命令无法匹配任何规则时，弹出使用帮助菜单
