@@ -847,13 +847,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
   return image.resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
 }
 
-/** 新版 API 只接受远程头像 URL；用本地已下载的头像替换它绘制的圆形占位头像。 */
-async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buffer> {
-  const groups = messages.filter(message => message.avatar);
-  if (!groups.some(message => message.from.photo?.url?.startsWith("data:"))) return buffer;
-  const sharp = (await import("sharp")).default;
-  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const { width, height } = info;
+function findQuoteAvatarCircles(data: Buffer, width: number, height: number) {
   const visited = new Uint8Array(width * height);
   const circles: { left: number; top: number; right: number; bottom: number }[] = [];
   // 头像独占最左侧一列。沿 alpha 连通区域寻找圆形，不依赖文字长度或缩放比例。
@@ -877,6 +871,17 @@ async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buf
     const w = right - left + 1, h = bottom - top + 1;
     if (w >= 8 && Math.abs(w - h) <= 3 && w < width / 2) circles.push({ left, right, top, bottom });
   }
+  return circles;
+}
+
+/** 新版 API 只接受远程头像 URL；用本地已下载的头像替换它绘制的圆形占位头像。 */
+async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buffer> {
+  const groups = messages.filter(message => message.avatar);
+  if (!groups.some(message => message.from.photo?.url?.startsWith("data:"))) return buffer;
+  const sharp = (await import("sharp")).default;
+  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { width, height } = info;
+  const circles = findQuoteAvatarCircles(data, width, height);
   if (circles.length !== groups.length) {
     console.warn("[yvlux] 头像布局未匹配，保留 API 返回的头像");
     return buffer;
@@ -895,6 +900,56 @@ async function restoreGlassAvatars(buffer: Buffer, messages: any[]): Promise<Buf
     }
   }
   return sharp(data, { raw: { width, height, channels: 4 } }).webp({ lossless: true }).toBuffer();
+}
+
+/** 末步统一放大头像并居中；尽量复用透明留白，保持正文和气泡的大小。 */
+async function centerQuoteArtwork(buffer: Buffer, messages: any[] = []): Promise<Buffer> {
+  const sharp = (await import("sharp")).default;
+  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  let left = info.width, top = info.height, right = -1, bottom = -1;
+  for (let y = 0; y < info.height; y++) for (let x = 0; x < info.width; x++) {
+    if (!data[(y * info.width + x) * 4 + 3]) continue;
+    left = Math.min(left, x); right = Math.max(right, x);
+    top = Math.min(top, y); bottom = Math.max(bottom, y);
+  }
+  if (right < left) return buffer;
+  const groups = messages.filter(message => message.avatar);
+  const circles = findQuoteAvatarCircles(data, info.width, info.height);
+  const resizeAvatars = circles.length > 0 && circles.length === groups.length;
+  const avatars: any[] = [];
+  const extraLeft = resizeAvatars ? Math.max(...circles.map(circle => Math.round((circle.right - circle.left + 1) * 0.16))) : 0;
+  let extraTop = 0;
+  if (resizeAvatars) for (const [index, circle] of circles.entries()) {
+    const oldSize = circle.right - circle.left + 1, size = Math.round(oldSize * 1.16);
+    const image = /^data:image\/[\w.+-]+;base64,(.+)$/i.exec(groups[index].from.photo?.url || "");
+    const source = image ? Buffer.from(image[1], "base64") : await sharp(buffer)
+      .extract({ left: circle.left, top: circle.top, width: oldSize, height: circle.bottom - circle.top + 1 }).png().toBuffer();
+    const avatar = await sharp(source).resize(size, size, { fit: "cover" }).composite([{
+      input: Buffer.from(`<svg width="${size}" height="${size}"><circle cx="${size / 2}" cy="${size / 2}" r="${size / 2}" fill="white"/></svg>`), blend: "dest-in",
+    }]).png().toBuffer();
+    const avatarLeft = circle.left - left + extraLeft - (size - oldSize), avatarTop = circle.bottom - top + 1 - size;
+    avatars.push({ input: avatar, left: avatarLeft, top: avatarTop });
+    extraTop = Math.max(extraTop, -avatarTop);
+    // 只擦掉圆形头像及抗锯齿边缘，保留包围框角落附近的气泡尾巴。
+    const cx = circle.left + oldSize / 2, cy = circle.top + (circle.bottom - circle.top + 1) / 2;
+    for (let y = Math.max(0, circle.top - 1); y <= Math.min(info.height - 1, circle.bottom + 1); y++) {
+      for (let x = Math.max(0, circle.left - 1); x <= Math.min(info.width - 1, circle.right + 1); x++) {
+        if (Math.hypot(x + 0.5 - cx, y + 0.5 - cy) <= oldSize / 2 + 1) data[(y * info.width + x) * 4 + 3] = 0;
+      }
+    }
+  }
+  const width = right - left + 1 + extraLeft, height = bottom - top + 1 + extraTop;
+  const canvasWidth = Math.max(info.width, width), canvasHeight = Math.max(info.height, height);
+  const targetLeft = Math.floor((canvasWidth - width) / 2), targetTop = Math.floor((canvasHeight - height) / 2);
+  if (!resizeAvatars && left === targetLeft && top === targetTop) return buffer;
+  const artwork = await sharp(data, { raw: { width: info.width, height: info.height, channels: 4 } })
+    .extract({ left, top, width: right - left + 1, height: bottom - top + 1 }).png().toBuffer();
+  const centered = await sharp({ create: { width: canvasWidth, height: canvasHeight, channels: 4, background: "#00000000" } })
+    .composite([
+      { input: artwork, left: targetLeft + extraLeft, top: targetTop + extraTop },
+      ...avatars.map(avatar => ({ ...avatar, left: targetLeft + avatar.left, top: targetTop + extraTop + avatar.top })),
+    ]).png().toBuffer();
+  return sharp(centered).resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true }).webp({ lossless: true }).toBuffer();
 }
 
 /** 语录中的媒体统一为本地预览，避免旧媒体接口绕过玻璃、全名和群标签处理。 */
@@ -1160,6 +1215,8 @@ class YvluPlugin extends Plugin {
           console.warn(`[yvlux] 整图布局异常，改为逐条渲染后合成: ${error.message}`);
           buffer = await this.renderQuoteRows(quoteData, data, headers);
         }
+        // 头像替换和异常恢复都完成后再居中，中间识别仍使用原来的坐标。
+        buffer = await centerQuoteArtwork(buffer, quoteData.messages);
       }
       return { buffer, ext: "webp" };
     } catch (error) {
