@@ -488,6 +488,8 @@ async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
   const extra = Math.max(1, Math.round(2 * scale));
   const outWidth = width + extra * 2, outHeight = height + bubbles.length * extra * 2;
   const layers: any[] = [];
+  const finishMasks: any[] = [];
+  const finishRegions: any[] = [];
   let start = 0;
   for (const [index, bubble] of bubbles.entries()) {
     const end = index + 1 < bubbles.length ? Math.floor((bubble.bottom + bubbles[index + 1].top) / 2) + 1 : height;
@@ -520,6 +522,9 @@ async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
       <path d="${shape}" fill="url(#fill)"/>
       <g clip-path="url(#bubble)" fill="none"><path d="${shape}" stroke="white" stroke-opacity="0.09" stroke-width="${lw * 2}"/><path d="${shape}" stroke="url(#light)" stroke-width="${lw * 2.6}"/></g></g></svg>`;
     layers.push({ input: Buffer.from(svg), left: 0, top: 0 });
+    // 材质只作用在气泡内部，避开现有描边和顶部高光。
+    finishMasks.push({ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><path transform="translate(${bodyLeft} ${bubble.top + offsetY})" d="${shape}" fill="white" stroke="black" stroke-width="${lw * 4}"/></svg>`), left: 0, top: 0 });
+    finishRegions.push({ left: bodyLeft, top: bubble.top + offsetY, width: w, height: h });
     // 光学内边距按可见字形计量；底部多保留一段，以免裁掉字母下伸部。
     const side = Math.round(16 * scale), above = Math.round(12 * scale), below = Math.round(8 * scale);
     const content = { left: bodyLeft + side, top: bubble.top + above, width: oldW - side * 2, height: oldH - above - below };
@@ -532,6 +537,26 @@ async function expandGlassPadding(buffer: Buffer): Promise<Buffer> {
     start = end;
   }
   const output = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(layers).raw().toBuffer();
+  const finishMask = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(finishMasks).raw().toBuffer();
+  for (const region of finishRegions) {
+    for (let y = region.top; y < Math.min(outHeight, region.top + region.height); y++) {
+      for (let x = region.left; x < Math.min(outWidth, region.left + region.width); x++) {
+        const pixel = (y * outWidth + x) * 4;
+        const mask = finishMask[pixel] * finishMask[pixel + 3] / (255 * 255);
+        const brightest = Math.max(output[pixel], output[pixel + 1], output[pixel + 2]);
+        // 保留文字、昵称和标签的亮色；背景的变化限制在约 4 个色阶内。
+        const weight = mask * Math.max(0, Math.min(1, (86 - brightest) / 26));
+        if (!weight) continue;
+        const u = (x - region.left) / region.width, v = (y - region.top) / region.height;
+        const softLight = 4 * Math.exp(-Math.pow((u - 0.16) / 0.9, 2) - Math.pow((v - 0.12) / 0.75, 2));
+        // 固定的细颗粒，避免每次生成出现不同强度的噪点。
+        const hash = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
+        const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 1.2;
+        const lift = (softLight + grain) * weight;
+        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round(output[pixel + channel] + lift)));
+      }
+    }
+  }
   let right = 0, bottom = 0;
   for (let y = 0; y < outHeight; y++) for (let x = 0; x < outWidth; x++) {
     if (output[(y * outWidth + x) * 4 + 3]) { right = Math.max(right, x); bottom = Math.max(bottom, y); }
