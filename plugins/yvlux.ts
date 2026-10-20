@@ -499,7 +499,7 @@ const DEFAULT_API_URL = "https://quote.yuri.ly/generate.webp";
 const MEDIA_API_URL = "https://quote-api-enhanced.zhetengsha.eu.org/generate.webp";
 const QUOTE_APPEARANCE = {
   style: "glass",
-  backgroundColor: "#382545/#261a33",
+  backgroundColor: "#302737/#221d2a",
 };
 
 function quoteBodyText(message: any): string {
@@ -676,7 +676,6 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
   const sharp = (await import("sharp")).default;
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = info;
-  const [fillStart, fillEnd] = QUOTE_APPEARANCE.backgroundColor.split("/");
   const seen = new Uint8Array(width * height);
   const parts: any[] = [];
   for (let seed = 0; seed < seen.length; seed++) {
@@ -765,7 +764,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
       ` V ${rTL} A ${rTL} ${rTL} 0 0 1 ${rTL} 0 Z`;
     const lw = 2 * scale;
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><defs>
-      <linearGradient id="fill" gradientUnits="userSpaceOnUse" x1="${extra}" y1="${extra}" x2="${extra + oldW}" y2="${extra + oldH}"><stop stop-color="${fillStart}"/><stop offset="1" stop-color="${fillEnd}"/></linearGradient>
+      <linearGradient id="fill" gradientUnits="userSpaceOnUse" x1="${extra}" y1="${extra}" x2="${extra + oldW}" y2="${extra + oldH}"><stop stop-color="#302737"/><stop offset="1" stop-color="#221d2a"/></linearGradient>
       <linearGradient id="light" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${h * 0.4}"><stop stop-color="white" stop-opacity="0.22"/><stop offset="1" stop-color="white" stop-opacity="0"/></linearGradient>
       <clipPath id="bubble"><path d="${shape}"/></clipPath>
       <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${3 * scale}"/></filter>
@@ -815,8 +814,6 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
   }
   const output = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(layers).raw().toBuffer();
   const finishMask = await sharp({ create: { width: outWidth, height: outHeight, channels: 4, background: "#00000000" } }).composite(finishMasks).raw().toBuffer();
-  // 柔光偏淡紫，避免等量抬高 RGB 后把深紫底色洗成灰白。
-  const tint = [1, 0.55, 1.15];
   for (const region of finishRegions) {
     for (let y = region.top; y < Math.min(outHeight, region.top + region.height); y++) {
       for (let x = region.left; x < Math.min(outWidth, region.left + region.width); x++) {
@@ -834,7 +831,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
         const hash = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
         const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 0.6;
         const lift = (softLight + grain) * weight;
-        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round(output[pixel + channel] + lift * tint[channel])));
+        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round(output[pixel + channel] + lift)));
         output[pixel + 3] = Math.round(output[pixel + 3] * (1 - 0.07 * weight));
       }
     }
