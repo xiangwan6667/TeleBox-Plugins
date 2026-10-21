@@ -312,10 +312,14 @@ function selectPickedMessages<T>(messages: T[], positions: number[]): T[] {
 }
 
 function parseQuoteOptions(input: string) {
-  const tokens: { value: string; start: number; quoted: boolean }[] = [];
+  const tokens: { value: string; start: number; end: number; quoted: boolean }[] = [];
+  const quotePairs: Record<string, string> = { '"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』" };
+  // 只清理选项名中的复制控制符；姓名、标签、正文中的 Emoji/ZWJ 保持原样。
+  const optionKey = (value: string) => value.replace(/[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g, "").toLowerCase();
+  const reserved = (value: string) => /^(p|pick|r|n|t|g|s|config|api)$/.test(optionKey(value));
   for (let i = 0; i < input.length;) {
-    if (/\s/.test(input[i])) { i++; continue; }
-    const start = i, quote = input[i] === '"' || input[i] === "'" ? input[i++] : "";
+    if (/[\s\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069]/.test(input[i])) { i++; continue; }
+    const start = i, quote = quotePairs[input[i]] ? quotePairs[input[i++]] : "";
     let value = "", closed = !quote;
     while (i < input.length) {
       if (quote && input[i] === quote) { i++; closed = true; break; }
@@ -325,32 +329,41 @@ function parseQuoteOptions(input: string) {
     }
     if (!closed) throw new Error("引号没有闭合");
     if (quote && i < input.length && !/\s/.test(input[i])) throw new Error("引号后的选项之间需要空格");
-    tokens.push({ value, start, quoted: !!quote });
+    tokens.push({ value, start, end: i, quoted: !!quote });
   }
   let count = 1, countSet = false, pickPositions: number[] | undefined, r = false;
   let customName: string | undefined, customText: string | undefined, customTag: string | undefined;
   const valueAfter = (index: number, mode: string, allowEmpty = false) => {
     const token = tokens[index + 1];
-    if (!token || (!token.value.trim() && !(allowEmpty && token.quoted)) || (!token.quoted && /^(p|pick|r|n|t|g|s|config|api)$/i.test(token.value))) throw new Error(`${mode} 后需要提供内容；包含空格或保留字时用引号包住`);
-    return token.value;
+    if (!token || (!token.value.trim() && !(allowEmpty && token.quoted)) || (!token.quoted && reserved(token.value))) throw new Error(`${mode} 后需要提供内容；与选项同名时用引号包住`);
+    let last = index + 1;
+    if (mode === "t" && !token.quoted) {
+      while (last + 1 < tokens.length) {
+        const next = tokens[last + 1];
+        if (next.quoted || reserved(next.value) || /^[+-]?\d+$/.test(next.value)) break;
+        last++;
+      }
+    }
+    return { value: token.quoted ? token.value : input.slice(token.start, tokens[last].end), last };
   };
   for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i], mode = token.quoted ? "" : token.value.toLowerCase();
+    const token = tokens[i], mode = token.quoted ? "" : optionKey(token.value);
     if (mode === "p" || mode === "pick") {
       if (pickPositions || countSet) throw new Error("连续数量和 p 跳选只能选择一种");
-      pickPositions = parsePickPositions(valueAfter(i, "p"));
-      count = pickPositions[pickPositions.length - 1]; i++;
+      const value = valueAfter(i, "p");
+      pickPositions = parsePickPositions(value.value);
+      count = pickPositions[pickPositions.length - 1]; i = value.last;
     } else if (mode === "r") {
       r = true;
     } else if (mode === "n") {
       if (customName !== undefined) throw new Error("n 改名只能设置一次");
-      customName = valueAfter(i, "n"); i++;
+      const value = valueAfter(i, "n"); customName = value.value; i = value.last;
     } else if (mode === "t") {
       if (customText !== undefined) throw new Error("自定义文字只能设置一次");
-      customText = valueAfter(i, "t"); i++;
+      const value = valueAfter(i, "t"); customText = value.value; i = value.last;
     } else if (mode === "g") {
       if (customTag !== undefined) throw new Error("g 标签只能设置一次");
-      customTag = valueAfter(i, "g", true).trim(); i++;
+      const value = valueAfter(i, "g", true); customTag = value.value.trim(); i = value.last;
     } else if (!token.quoted && /^[+-]?\d+$/.test(token.value)) {
       if (countSet || pickPositions) throw new Error("连续数量和 p 跳选只能选择一种");
       count = Number(token.value); countSet = true;
@@ -564,8 +577,9 @@ async function getQuoteSenderTag(message: any, sender: any, client: any, cache: 
 
 // 用同一后端绘制短文字片段，再在本地排版，避开后端 300px 标题行的淡出截断。
 // 头像、中文字体、普通及自定义 Emoji 仍由已有渲染路径处理。
-const quoteHeaderCache = new Map<string, Buffer>();
-async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promise<(Buffer | undefined)[]> {
+type QuoteHeader = { buffer: Buffer; tagLeft: number; tagWidth: number };
+const quoteHeaderCache = new Map<string, QuoteHeader>();
+async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promise<(QuoteHeader | undefined)[]> {
   const sharp = (await import("sharp")).default;
   const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
   const chunks = (text: string) => {
@@ -586,7 +600,7 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
     return { key, name, tag, from };
   });
   const missing = new Map<string, any>();
-  const rendered = new Map<string, Buffer>();
+  const rendered = new Map<string, QuoteHeader>();
   for (const entry of entries) if (entry && quoteHeaderCache.has(entry.key)) rendered.set(entry.key, quoteHeaderCache.get(entry.key)!);
   for (const entry of entries) if (entry && !quoteHeaderCache.has(entry.key)) missing.set(entry.key, entry);
   const rows: any[] = [];
@@ -649,21 +663,24 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
     }
     for (const entry of missing.values()) {
       const layers: any[] = [];
-      let x = 0, baseline = 0, below = 0, previousKind = "";
+      let x = 0, baseline = 0, below = 0, previousKind = "", tagLeft = -1;
       for (const row of rows.filter(row => row.entry === entry)) {
-        const factor = (row.kind === "name" ? 20 : 15) / 22;
+        // 正文已放大到约 28px；姓名用 24px，恢复接近参考图的字号比例。
+        const factor = (row.kind === "name" ? 24 : 15) / 22;
         const width = Math.max(1, Math.round(row.image.info.width * factor));
         const height = Math.max(1, Math.round(row.image.info.height * factor));
         // 姓名和无框标签始终在同一行；宽度随内容增长，最终整张贴纸统一缩放。
         if (x) x += row.kind !== previousKind ? 16 : row.space ? 12 : 2;
+        if (row.kind === "tag" && tagLeft < 0) tagLeft = x;
         const image = await sharp(row.image.data, { raw: { width: row.image.info.width, height: row.image.info.height, channels: 4 } }).resize(width, height).png().toBuffer();
         const rowBaseline = Math.round(row.baseline * factor);
         layers.push({ input: image, left: x, top: 0, baseline: rowBaseline });
         x += width; baseline = Math.max(baseline, rowBaseline); below = Math.max(below, height - rowBaseline); previousKind = row.kind;
       }
       if (!layers.length) continue;
-      const header = await sharp({ create: { width: x, height: baseline + below, channels: 4, background: "#00000000" } })
+      const buffer = await sharp({ create: { width: x, height: baseline + below, channels: 4, background: "#00000000" } })
         .composite(layers.map(({ baseline: rowBaseline, ...layer }) => ({ ...layer, top: baseline - rowBaseline }))).png().toBuffer();
+      const header = { buffer, tagLeft: tagLeft < 0 ? x : tagLeft, tagWidth: tagLeft < 0 ? 0 : x - tagLeft };
       if (quoteHeaderCache.size >= 64) quoteHeaderCache.delete(quoteHeaderCache.keys().next().value);
       quoteHeaderCache.set(entry.key, header);
       rendered.set(entry.key, header);
@@ -673,7 +690,7 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
 }
 
 /** 扩大气泡内边距，复用原文字图层和 glass 高光参数。 */
-async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[] = [], messages: any[] = [], normalize = true, contentScale = 1): Promise<Buffer> {
+async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefined)[] = [], messages: any[] = [], normalize = true, contentScale = 1): Promise<Buffer> {
   const sharp = (await import("sharp")).default;
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = info;
@@ -713,9 +730,11 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
   if (headers.length && bubbles.length !== headers.length) throw new QuoteLayoutError(`消息气泡数量不匹配：${bubbles.length}/${headers.length}`);
   const renderedHeaders = await Promise.all(bubbles.map(async (_, index) => {
     if (!headers[index]) return undefined;
-    const meta = await sharp(headers[index]).metadata();
+    const header = headers[index]!;
+    const meta = await sharp(header.buffer).metadata();
     const w = Math.max(1, Math.round(meta.width! * scale / 2)), h = Math.max(1, Math.round(meta.height! * scale / 2));
-    return { buffer: await sharp(headers[index]).resize(w, h).png().toBuffer(), width: w, height: h };
+    const tagLeft = Math.min(w, Math.round(header.tagLeft * scale / 2));
+    return { buffer: await sharp(header.buffer).resize(w, h).png().toBuffer(), width: w, height: h, tagLeft, tagWidth: header.tagWidth ? w - tagLeft : 0 };
   }));
   const decodeImage = (url?: string) => {
     const match = /^data:image\/[\w.+-]+;base64,(.+)$/i.exec(url || "");
@@ -787,7 +806,14 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
     finishRegions.push({ left: bodyLeft, top: bubble.top + offsetY, width: w, height: h });
     // 光学内边距按可见字形计量；底部多保留一段，以免裁掉字母下伸部。
     layers.push({ input: await sharp(buffer).extract(content).resize(contentW, contentH).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra + headerHeight });
-    if (header) layers.push({ input: header.buffer, left: bodyLeft + Math.round(18 * scale), top: bubble.top + offsetY + Math.round(18 * scale) });
+    if (header) {
+      const left = bodyLeft + Math.round(18 * scale), top = bubble.top + offsetY + Math.round(18 * scale);
+      if (header.tagWidth) {
+        // 姓名固定靠左，标签贴合各自气泡右侧的内边距；两者共用同一基线。
+        if (header.tagLeft) layers.push({ input: await sharp(header.buffer).extract({ left: 0, top: 0, width: header.tagLeft, height: header.height }).png().toBuffer(), left, top });
+        layers.push({ input: await sharp(header.buffer).extract({ left: header.tagLeft, top: 0, width: header.tagWidth, height: header.height }).png().toBuffer(), left: bodyLeft + w - Math.round(18 * scale) - header.tagWidth, top });
+      } else layers.push({ input: header.buffer, left, top });
+    }
     const addImage = async (source: Buffer, left: number, top: number, imageW: number, imageH: number, radius: number) => {
       const rounded = await sharp(source).resize(imageW, imageH, { fit: "cover" }).composite([{ input: Buffer.from(`<svg width="${imageW}" height="${imageH}"><rect width="${imageW}" height="${imageH}" rx="${radius}" fill="white"/></svg>`), blend: "dest-in" }]).png().toBuffer();
       layers.push({ input: rounded, left, top });
@@ -838,8 +864,9 @@ async function expandGlassPadding(buffer: Buffer, headers: (Buffer | undefined)[
         const hash = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
         const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 0.6;
         const lift = (softLight + grain) * weight;
-        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round(output[pixel + channel] + lift)));
-        output[pixel + 3] = Math.round(output[pixel + 3] * (1 - 0.07 * weight));
+        // 少量压黑并减半透光，描边、高光和亮色文字仍沿用原效果。
+        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round((output[pixel + channel] + lift) * (1 - 0.04 * weight))));
+        output[pixel + 3] = Math.round(output[pixel + 3] * (1 - 0.035 * weight));
       }
     }
   }
@@ -1108,7 +1135,7 @@ class YvluPlugin extends Plugin {
    * 知识点：调用后端 quote-api 核心函数
    * 发送组装好的 JSON 给远端，要求返回 arraybuffer 流 (贴纸图片或动图)
    */
-  private async renderQuoteRows(quoteData: any, data: any, headers: (Buffer | undefined)[]): Promise<Buffer> {
+  private async renderQuoteRows(quoteData: any, data: any, headers: (QuoteHeader | undefined)[]): Promise<Buffer> {
     const sharp = (await import("sharp")).default;
     const scale = 2, shadowPad = 4 * scale;
     const messages = quoteData.messages;

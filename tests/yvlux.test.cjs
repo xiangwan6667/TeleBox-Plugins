@@ -273,9 +273,9 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.ok(headerRequest,'one glyph sheet request');
   assert.equal(headerRequest.data.messages.map(message=>message.from.name.replace(/^H /,'')).join('').replace(/\s/g,''),(fullName+fullTag).replace(/\s/g,''),'all name and tag characters are sent without truncation');
   assert.ok(headerRequest.data.messages.every(message=>!message.senderTag),'no API pill or capped name/tag row');
-  const headerMeta=await sharp(fullHeader).metadata();
+  const headerMeta=await sharp(fullHeader.buffer).metadata();
   assert.ok(headerMeta.width>headerMeta.height*8,'complete header stays on one line');
-  const headerAlpha=await sharp(fullHeader).ensureAlpha().raw().toBuffer();
+  const headerAlpha=await sharp(fullHeader.buffer).ensureAlpha().raw().toBuffer();
   assert.ok(headerAlpha.filter((_,i)=>i%4===3 && headerAlpha[i]===0).length>0,'header background stays transparent');
   const beforeCache=requests.length;
   await exportsObj._headers(headerMessages);
@@ -284,8 +284,57 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   const assembledMeta=await sharp(assembled).metadata();
   assert.equal(Math.max(assembledMeta.width,assembledMeta.height),512,'whole quote scales into sticker bounds');
   assert.ok(assembledMeta.height<240,'long single-line header widens the quote and scales all text together');
+  const [rightHeader]=await exportsObj._headers([{avatar:true,from:{id:123,name:'良民'},senderTag:'1.8cm'}]);
+  const headerFixture=async bubbleWidth=>sharp(Buffer.from(`<svg width="600" height="240"><rect x="80" y="10" width="${bubbleWidth}" height="120" rx="26" fill="#302737"/><circle cx="25" cy="101" r="25" fill="#ff4444"/></svg>`)).png().toBuffer();
+  const headerInk=async buffer=>{
+    const {data,info}=await sharp(buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+    let tagRight=-1,nameLeft=info.width;
+    for(let y=0;y<Math.min(52,info.height);y++)for(let x=60;x<info.width;x++){
+      const i=(y*info.width+x)*4,[r,g,b,a]=data.subarray(i,i+4);
+      if(a>128&&r>110&&r<200&&r-g>=4&&b-r>=4)tagRight=Math.max(tagRight,x);
+      if(a>240&&Math.min(r,g,b)>245)nameLeft=Math.min(nameLeft,x);
+    }
+    assert.ok(tagRight>0 && nameLeft<info.width,'name and plain muted tag both remain visible');
+    return {tagRight,nameLeft};
+  };
+  const narrowHeader=await headerInk(await exportsObj._expand(await headerFixture(260),[rightHeader],[],false));
+  const wideHeader=await headerInk(await exportsObj._expand(await headerFixture(410),[rightHeader],[],false));
+  assert.ok(Math.abs(wideHeader.tagRight-narrowHeader.tagRight-150)<=1,'tag tracks the bubble right edge when the body widens');
+  assert.equal(wideHeader.nameLeft,narrowHeader.nameLeft,'name stays left aligned while tag moves right');
   const parsed=exportsObj._parse('5 r n "新的 名字" t "新的 内容"');
   assert.equal(parsed.count,5);assert.equal(parsed.r,true);assert.equal(parsed.customName,'新的 名字');assert.equal(parsed.customText,'新的 内容');
+  const numericOptions=exportsObj._parse('n 111 t 111 g 111');
+  assert.equal(numericOptions.count,1);assert.equal(numericOptions.customName,'111');assert.equal(numericOptions.customText,'111');assert.equal(numericOptions.customTag,'111');
+  const comboLive=process.argv.includes('--combo-live');
+  if(comboLive){exportsObj._clearHeaders();liveQuote=true;}
+  const numericRequest=await run('.yvlux n 111 t 111 g 111',[message(10,'原文')]);
+  assert.equal(numericRequest.data.messages[0].text,'111');assert.equal(numericRequest.data.messages[0].from.first_name,'111');assert.equal(quoteInputs[0].messages[0].senderTag,'111');
+  if(comboLive&&process.env.YVLUX_PREVIEW_DIR){fs.mkdirSync(process.env.YVLUX_PREVIEW_DIR,{recursive:true});await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-numeric-combo.png'));}
+  const spacedRequest=await run('.yvlux n "New Name" t new body text g "Group Tag"',[message(10,'原文')]);
+  assert.equal(spacedRequest.data.messages[0].text,'new body text');assert.equal(spacedRequest.data.messages[0].from.first_name,'New Name');assert.equal(quoteInputs[0].messages[0].senderTag,'Group Tag');
+  await run('.yvlux n\u200b 111 t\u200e 111 \u2066g\u2069 111',[message(10,'原文')]);
+  if(comboLive){
+    await run('.yvlux n 良民 g 1.8cm',[message(10,'完全符合需求')]);
+    if(process.env.YVLUX_PREVIEW_DIR)await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-right-tag.png'));
+    liveQuote=false;
+  }
+  for(const order of [['n','t','g'],['n','g','t'],['t','n','g'],['t','g','n'],['g','n','t'],['g','t','n']]){
+    for(const selector of ['','5','p 1,6,8'])for(const reply of ['','r']){
+      const options=exportsObj._parse([selector,...order.map(option=>`${option} 111`),reply].filter(Boolean).join(' '));
+      assert.equal(options.customName,'111');assert.equal(options.customText,'111');assert.equal(options.customTag,'111');assert.equal(options.r,!!reply);
+    }
+  }
+  const spaced=exportsObj._parse('n "New Name" t new body text g "Group Tag" r 3');
+  assert.equal(spaced.customName,'New Name');assert.equal(spaced.customText,'new body text');assert.equal(spaced.customTag,'Group Tag');assert.equal(spaced.count,3);assert.equal(spaced.r,true);
+  const legacyBody=exportsObj._parse('n Legacy 自定义正文');
+  assert.equal(legacyBody.customName,'Legacy');assert.equal(legacyBody.customText,'自定义正文','legacy bare custom body after a single-word name remains compatible');
+  for(const [open,close]of [['“','”'],['‘','’'],['「','」'],['『','』']]){
+    const smart=exportsObj._parse(`n ${open}n r${close} t ${open}new body${close} g ${open}${close}`);
+    assert.equal(smart.customName,'n r');assert.equal(smart.customText,'new body');assert.equal(smart.customTag,'');
+  }
+  const copied=exportsObj._parse('n\u200b 111 t\u200e 111 \u2066g\u2069 111');
+  assert.equal(copied.customName,'111');assert.equal(copied.customText,'111');assert.equal(copied.customTag,'111');
+  assert.equal(exportsObj._parse('t "👨‍👩‍👧‍👦 r n"').customText,'👨‍👩‍👧‍👦 r n','format cleanup never changes quoted text or emoji ZWJ');
   const selected=exportsObj._parse('n "r" t "p n r" r p 8,1,6，6');
   assert.equal(selected.count,8);assert.deepEqual([...selected.pickPositions],[1,6,8]);assert.equal(selected.customName,'r');assert.equal(selected.customText,'p n r');
   assert.equal(exportsObj._parse('r 3 你好  世界\n第二行').customText,'你好  世界\n第二行');
@@ -403,7 +452,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   await plugin.cmdHandlers.yvlux({message:'.yvlux help',edit:async options=>{compactHelp=options.text;}});
   assert.match(compactHelp,/g "标签"/);assert.match(compactHelp,/组合示例/);assert.equal(plugin.description,compactHelp);
   assert.ok(compactHelp.replace(/<[^>]+>/g,'').length<450,'help stays compact');assert.doesNotMatch(compactHelp,/增强版|高光|本地合成|旧接口|后端/);
-  console.log('PASS: g custom/hidden tags, all 48 r/n/t/g selector combinations parsed, author scope, paging, real tag preservation, and compact help.');
+  console.log('PASS: numeric n/t/g command, 36 option orders, spaced/smart-quoted/copied options, right-aligned plain tags, all 48 r/n/t/g selector combinations, author scope, and compact help.');
   if(process.argv.includes('--layout-only'))return;
   // 所有有效选择器 × r/n/t 子集，分别覆盖文本、图片、贴纸及动画缩略图。
   // --live 只针对合成测试图片访问默认绘图接口，Telegram 始终是模拟客户端。

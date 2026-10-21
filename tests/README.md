@@ -8,6 +8,16 @@ node tests/yvlux.test.cjs
 
 测试使用模拟 Telegram 客户端及本地生成的图片，覆盖组合命令、分张、改名范围、跳选序号、无框标签、完整单行昵称、比例缩放和失败进度。测试不访问绘图接口，也不发送 Telegram 消息。
 
+## stsave 视频贴纸尺寸回归检查
+
+需要 Node.js 22+、`typescript`、`sharp` 及 FFmpeg（`ffmpeg` 和 `ffprobe`）。`STSAVE_TEST_DEPS` 可指向独立安装依赖的目录。
+
+```text
+node tests/stsave.test.cjs
+```
+
+使用真实转码和模拟 Telegram 客户端，检查现成 WebM 被 `STICKER_VIDEO_DIMENSIONS` 拒绝后自动修复并重试、新建/追加贴纸包、原表情与目标包保留、重试次数、上传尺寸/时长属性和临时文件清理。合成透明动画验证 512px、VP9、最长 3 秒、最高 30 FPS、256KB 上限、透明通道与帧变化；另检查 MP4 去音轨、GIF 转换，以及正常 WebM/TGS/静态贴纸直接复用。测试不发送真实消息、不创建或修改真实贴纸包。
+
 ## aix 头像参考与生成回归检查
 
 需要 Node.js 22+、`typescript@5.9.3`（使用 `transpileModule` API）和 `sharp`，可通过 `AIX_TEST_DEPS` 指向依赖目录。

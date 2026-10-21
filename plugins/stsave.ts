@@ -41,6 +41,15 @@ interface DetectedInput {
   sticker?: StickerInfo;
 }
 
+interface StickerVideoInfo {
+  width: number;
+  height: number;
+  duration: number;
+  codec: string;
+  fps: number;
+  audio: boolean;
+}
+
 const DEFAULT_CONFIG: StickerSaverConfig = {
   pack: "",
   defaultEmoji: "⭐",
@@ -199,19 +208,40 @@ async function convertImageToWebp(input: Buffer): Promise<Buffer> {
   return best;
 }
 
-async function convertVideoToWebm(input: Buffer): Promise<Buffer> {
+async function probeStickerVideo(file: string): Promise<StickerVideoInfo> {
+  const { stdout } = await execFileAsync("ffprobe", [
+    "-v", "error", "-show_streams", "-show_format", "-of", "json", file,
+  ], { timeout: 60000, maxBuffer: 2 * 1024 * 1024 });
+  const metadata = JSON.parse(stdout);
+  const video = metadata.streams?.find((stream: any) => stream.codec_type === "video");
+  if (!video) throw new Error("媒体中没有可用的视频画面");
+  const [numerator, denominator = 1] = String(video.avg_frame_rate || video.r_frame_rate || "0").split("/").map(Number);
+  return {
+    width: Number(video.width), height: Number(video.height),
+    duration: Number(video.duration || metadata.format?.duration || 0),
+    codec: String(video.codec_name || ""), fps: denominator ? numerator / denominator : 0,
+    audio: metadata.streams.some((stream: any) => stream.codec_type === "audio"),
+  };
+}
+
+async function convertVideoToWebm(input: Buffer): Promise<{ buffer: Buffer; info: StickerVideoInfo }> {
   const unique = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const inputPath = path.join(os.tmpdir(), `stsave_video_${unique}.input`);
   const outputPath = path.join(os.tmpdir(), `stsave_video_${unique}.webm`);
   try {
     fs.writeFileSync(inputPath, input);
+    const source = await probeStickerVideo(inputPath);
+    // ffmpeg 的原生 VP9 解码器会丢掉 WebM 的透明通道；libvpx-vp9 能保留。
+    const decoder = source.codec === "vp9" ? ["-c:v", "libvpx-vp9"] : [];
     let best: Buffer = Buffer.from([]);
     for (const crf of VIDEO_CRF_STEPS) {
       await execFileAsync("ffmpeg", [
         "-hide_banner", "-loglevel", "error", "-y",
+        ...decoder,
         "-i", inputPath,
+        "-map", "0:v:0",
         "-t", "3",
-        "-vf", `scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,fps=${VIDEO_STICKER_FPS}`,
+        "-vf", `scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,format=yuva420p,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1,fps=${VIDEO_STICKER_FPS}`,
         "-an", "-c:v", "libvpx-vp9",
         "-pix_fmt", "yuva420p",
         "-deadline", "good", "-cpu-used", "3",
@@ -220,7 +250,7 @@ async function convertVideoToWebm(input: Buffer): Promise<Buffer> {
         "-auto-alt-ref", "0",
         "-metadata:s:v:0", "alpha_mode=1",
         outputPath,
-      ]);
+      ], { timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
       const candidate = fs.readFileSync(outputPath);
       if (candidate.length) best = candidate;
       if (candidate.length <= MAX_VIDEO_STICKER_BYTES) break;
@@ -228,7 +258,11 @@ async function convertVideoToWebm(input: Buffer): Promise<Buffer> {
     if (!best.length || best.length > MAX_VIDEO_STICKER_BYTES) {
       throw new Error(`转换后的 WebM 超过 256KB（${Math.ceil(best.length / 1024)}KB）`);
     }
-    return best;
+    const info = await probeStickerVideo(outputPath);
+    if (info.width !== 512 || info.height !== 512 || info.codec !== "vp9" || info.audio || !Number.isFinite(info.duration) || info.duration <= 0 || info.duration > 3.001 || !Number.isFinite(info.fps) || info.fps <= 0 || info.fps > VIDEO_STICKER_FPS) {
+      throw new Error("转换后的视频贴纸尺寸、时长或编码不符合要求");
+    }
+    return { buffer: best, info };
   } finally {
     for (const file of [inputPath, outputPath]) {
       try { fs.unlinkSync(file); } catch {}
@@ -248,9 +282,11 @@ function friendlyError(error: any): string {
   if (code.includes("STICKERSET_OWNER_ANONYMOUS")) return "无法确认贴纸包所有者";
   if (code.includes("STICKER_VIDEO_LONG")) return "视频贴纸不能超过 3 秒";
   if (code.includes("STICKER_VIDEO_BIG")) return "视频贴纸文件过大";
+  if (code.includes("STICKER_VIDEO_DIMENSIONS")) return "视频贴纸尺寸不符合 Telegram 要求（一边须为 512px，另一边不超过 512px）";
   if (code.includes("STICKER_PNG_DIMENSIONS")) return "静态贴纸尺寸不符合 Telegram 要求";
   if (code.includes("FILE_REFERENCE_EXPIRED")) return "贴纸文件引用已过期，请重新发送或转发这张贴纸后再保存";
   if (code.includes("FLOOD_WAIT")) return `操作过于频繁，请稍后重试：${code}`;
+  if (code.includes("ENOENT") && /ffmpeg|ffprobe/i.test(code)) return "需要安装 FFmpeg（包含 ffmpeg 和 ffprobe）才能修复或转换视频贴纸";
   return code || "未知错误";
 }
 
@@ -373,10 +409,18 @@ class StsavePlugin extends Plugin {
         ? await this.resolveConfiguredTarget(client, configured, sticker.kind)
         : await this.findAutomaticTarget(client, me, sticker.kind);
 
-      if (target.create) {
-        await this.createPack(client, me, target.packName, sticker);
-      } else {
-        await this.addSticker(client, target.packName, sticker);
+      const save = async () => {
+        if (target.create) await this.createPack(client, me, target.packName, sticker);
+        else await this.addSticker(client, target.packName, sticker);
+      };
+      try {
+        await save();
+      } catch (error) {
+        if (detected.mode !== "sticker" || sticker.kind !== "video" || !errorCode(error).includes("STICKER_VIDEO_DIMENSIONS")) throw error;
+        await msg.edit({ text: "⏳ 正在修复视频贴纸尺寸并重新保存…" });
+        sticker = await this.convertAndUploadMedia(client, replied, "video", sticker.emoji);
+        // 尺寸被服务器拒绝时只修复重试一次，继续使用同一个目标包。
+        await save();
       }
 
       await msg.edit({
@@ -418,9 +462,8 @@ class StsavePlugin extends Plugin {
     emoji: string,
   ): Promise<StickerInfo> {
     const input = await downloadMessageBuffer(client, message);
-    const converted = mode === "image"
-      ? await convertImageToWebp(input)
-      : await convertVideoToWebm(input);
+    const video = mode === "video" ? await convertVideoToWebm(input) : undefined;
+    const converted = video ? video.buffer : await convertImageToWebp(input);
     const kind: StickerKind = mode === "image" ? "static" : "video";
     const extension = mode === "image" ? "webp" : "webm";
     const tempPath = path.join(
@@ -439,29 +482,38 @@ class StsavePlugin extends Plugin {
       ];
       if (mode === "image") {
         attributes.splice(1, 0, new Api.DocumentAttributeImageSize({ w: 512, h: 512 }));
+      } else if (video) {
+        attributes.splice(1, 0,
+          new Api.DocumentAttributeImageSize({ w: video.info.width, h: video.info.height }),
+          new Api.DocumentAttributeVideo({ w: video.info.width, h: video.info.height, duration: video.info.duration, nosound: true }),
+        );
       }
 
       const uploaded = await client.sendFile("me", {
         file: tempPath,
         forceDocument: false,
+        mimeType: mode === "image" ? "image/webp" : "video/webm",
         attributes,
       });
-      if (!uploaded || !(uploaded.media instanceof Api.MessageMediaDocument)) {
-        throw new Error("上传转换后的贴纸失败");
+      try {
+        if (!uploaded || !(uploaded.media instanceof Api.MessageMediaDocument)) {
+          throw new Error("上传转换后的贴纸失败");
+        }
+        const document = uploaded.media.document;
+        if (!(document instanceof Api.Document)) throw new Error("无法获取转换后的贴纸文档");
+        return {
+          kind,
+          emoji,
+          source: document,
+          document: new Api.InputDocument({
+            id: document.id,
+            accessHash: document.accessHash,
+            fileReference: document.fileReference || Buffer.alloc(0),
+          }),
+        };
+      } finally {
+        try { await uploaded?.delete({ revoke: true }); } catch {}
       }
-      const document = uploaded.media.document;
-      if (!(document instanceof Api.Document)) throw new Error("无法获取转换后的贴纸文档");
-      try { await uploaded.delete({ revoke: true }); } catch {}
-      return {
-        kind,
-        emoji,
-        source: document,
-        document: new Api.InputDocument({
-          id: document.id,
-          accessHash: document.accessHash,
-          fileReference: document.fileReference || Buffer.alloc(0),
-        }),
-      };
     } finally {
       try { fs.unlinkSync(tempPath); } catch {}
     }
