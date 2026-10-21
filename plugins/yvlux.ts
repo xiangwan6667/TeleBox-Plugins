@@ -431,9 +431,9 @@ const help_text = `
 • <code>${commandName} 文字</code> — 自定义正文
 
 <b>组合示例</b>
-<code>${commandName} 3 n "小王" g "群友"</code>
+<code>${commandName} n "名字" g "标签" t "正文"</code>
 <code>${commandName} p 1,3 r t "文字"</code>
-数量与 p 二选一；n/g 只改首条作者，t 只改首条消息。带空格或与选项同名的内容加引号。
+单条、多条均可组合；数量与 p 二选一。多条时 n/g 改首条作者，t 改首条所选消息。带空格或与选项同名的内容加引号。
 
 <b>贴纸与设置（单独使用）</b>
 • <code>${commandName} s</code> — 保存图片 / 贴纸
@@ -513,7 +513,7 @@ const DEFAULT_API_URL = "https://quote.yuri.ly/generate.webp";
 const MEDIA_API_URL = "https://quote-api-enhanced.zhetengsha.eu.org/generate.webp";
 const QUOTE_APPEARANCE = {
   style: "glass",
-  backgroundColor: "#302737/#221d2a",
+  backgroundColor: "#241e2d/#392f45",
 };
 
 function quoteBodyText(message: any): string {
@@ -538,10 +538,7 @@ async function getQuoteSenderTag(message: any, sender: any, client: any, cache: 
   const peer = message.peerId;
   if (!(peer instanceof Api.PeerChannel) && !(peer instanceof Api.PeerChat)) return {};
   const directRank = message.fromRank ?? message.from_rank;
-  // 新版超级群消息自带 from_rank，直接使用消息上的标签，无需额外查询。
-  if (typeof directRank === "string" && directRank.trim()) {
-    return { senderTag: directRank.trim(), senderTagRole: "member" };
-  }
+  const directTag = typeof directRank === "string" ? directRank.trim() : "";
   try {
     let participant: any;
     if (peer instanceof Api.PeerChannel) {
@@ -567,11 +564,11 @@ async function getQuoteSenderTag(message: any, sender: any, client: any, cache: 
     const owner = /ParticipantCreator$/.test(kind);
     const admin = /ParticipantAdmin$/.test(kind);
     const rank = typeof participant?.rank === "string" ? participant.rank.trim() : "";
-    const text = rank || (owner ? "群主" : admin ? "管理员" : "");
-    return text ? { senderTag: text, senderTagRole: "member" } : {};
+    const text = directTag || rank || (owner ? "群主" : admin ? "管理员" : "");
+    return text ? { senderTag: text, senderTagRole: owner || admin ? "admin" : "member" } : {};
   } catch {
-    // 旧协议或无权查询成员时仍正常生成语录。
-    return {};
+    // 无权查询身份时仍保留消息自带的标签，不把未知身份当作管理员。
+    return directTag ? { senderTag: directTag, senderTagRole: "member" } : {};
   }
 }
 
@@ -596,8 +593,9 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
     const from = message.from || {};
     const name = (from.name || [from.first_name, from.last_name].filter(Boolean).join(" ") || from.username || "").replace(/[\r\n\t\u2028\u2029]/g, " ").trim();
     const tag = (message.senderTag || "").replace(/[\r\n\t\u2028\u2029]/g, " ").trim();
-    const key = JSON.stringify([from.id, name, tag, from.accentColorId, from.emoji_status, emojiBrand]);
-    return { key, name, tag, from };
+    const adminTag = message.senderTagRole === "admin";
+    const key = JSON.stringify([from.id, name, tag, adminTag, from.accentColorId, from.emoji_status, emojiBrand]);
+    return { key, name, tag, from, adminTag };
   });
   const missing = new Map<string, any>();
   const rendered = new Map<string, QuoteHeader>();
@@ -655,8 +653,9 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
       row.baseline = baseline - band.top;
       row.image = await sharp(sheet).extract({ left, top: band.top, width: right - left + 1, height: band.bottom - band.top + 1 }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
       if (row.kind === "tag") {
+        const color = row.entry.adminTag ? [100, 195, 125] : [180, 171, 191];
         for (let p = 0; p < row.image.data.length; p += 4) {
-          row.image.data[p] = 180; row.image.data[p + 1] = 171; row.image.data[p + 2] = 191;
+          row.image.data[p] = color[0]; row.image.data[p + 1] = color[1]; row.image.data[p + 2] = color[2];
           row.image.data[p + 3] = Math.round(row.image.data[p + 3] * 0.78);
         }
       }
@@ -689,9 +688,10 @@ async function renderQuoteHeaders(messages: any[], emojiBrand = "apple"): Promis
   return entries.map(entry => entry ? rendered.get(entry.key) : undefined);
 }
 
-/** 扩大气泡内边距，复用原文字图层和 glass 高光参数。 */
+/** 复用原文字图层，合成紧凑气泡和轻柔的紫色玻璃表面。 */
 async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefined)[] = [], messages: any[] = [], normalize = true, contentScale = 1): Promise<Buffer> {
   const sharp = (await import("sharp")).default;
+  const [glassLeft, glassRight] = QUOTE_APPEARANCE.backgroundColor.split("/");
   const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = info;
   const seen = new Uint8Array(width * height);
@@ -790,22 +790,42 @@ async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefi
     const shape = `M ${rTL} 0 H ${w - rTR} A ${rTR} ${rTR} 0 0 1 ${w} ${rTR} V ${h - rBR} A ${rBR} ${rBR} 0 0 1 ${w - rBR} ${h} ` +
       (tail ? `H ${-tail} C ${-tail * 0.4} ${h} 0 ${h - rBL * 0.3} 0 ${h - rBL}` : `H ${rBL} A ${rBL} ${rBL} 0 0 1 0 ${h - rBL}`) +
       ` V ${rTL} A ${rTL} ${rTL} 0 0 1 ${rTL} 0 Z`;
-    const lw = 2 * scale;
+    const lw = scale;
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><defs>
-      <linearGradient id="fill" gradientUnits="userSpaceOnUse" x1="${extra}" y1="${extra}" x2="${extra + oldW}" y2="${extra + oldH}"><stop stop-color="#302737"/><stop offset="1" stop-color="#221d2a"/></linearGradient>
-      <linearGradient id="light" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${h * 0.4}"><stop stop-color="white" stop-opacity="0.22"/><stop offset="1" stop-color="white" stop-opacity="0"/></linearGradient>
+      <linearGradient id="fill" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="${w}" y2="${h}"><stop stop-color="${glassLeft}"/><stop offset="1" stop-color="${glassRight}"/></linearGradient>
+      <linearGradient id="light" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${h * 0.45}"><stop stop-color="white" stop-opacity="0.12"/><stop offset="1" stop-color="white" stop-opacity="0"/></linearGradient>
       <clipPath id="bubble"><path d="${shape}"/></clipPath>
-      <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${3 * scale}"/></filter>
+      <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${2 * scale}"/></filter>
       </defs><g transform="translate(${bodyLeft} ${bubble.top + offsetY})">
-      <path d="${shape}" transform="translate(0 ${2 * scale})" fill="black" opacity="0.24" filter="url(#shadow)"/>
+      <path d="${shape}" transform="translate(0 ${scale})" fill="black" opacity="0.18" filter="url(#shadow)"/>
       <path d="${shape}" fill="url(#fill)"/>
-      <g clip-path="url(#bubble)" fill="none"><path d="${shape}" stroke="white" stroke-opacity="0.09" stroke-width="${lw * 2}"/><path d="${shape}" stroke="url(#light)" stroke-width="${lw * 2.6}"/></g></g></svg>`;
+      <g clip-path="url(#bubble)" fill="none"><path d="${shape}" stroke="white" stroke-opacity="0.045" stroke-width="${lw * 2}"/><path d="${shape}" stroke="url(#light)" stroke-width="${lw * 2}"/></g></g></svg>`;
     layers.push({ input: Buffer.from(svg), left: 0, top: 0 });
     // 材质只作用在气泡内部，避开现有描边和顶部高光。
     finishMasks.push({ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><path transform="translate(${bodyLeft} ${bubble.top + offsetY})" d="${shape}" fill="white" stroke="black" stroke-width="${lw * 4}"/></svg>`), left: 0, top: 0 });
     finishRegions.push({ left: bodyLeft, top: bubble.top + offsetY, width: w, height: h });
+    // 从无文字的左右内边距估计原背景，提取文字/引用图层；扩展后的气泡共用完整渐变，避免矩形色块。
+    const body = await sharp(buffer).extract(content).ensureAlpha().raw().toBuffer();
+    const sampleLeft = bodyLeft + Math.round(8 * scale), sampleRight = bubble.right - Math.round(8 * scale);
+    for (let y = 0; y < content.height; y++) {
+      const leftSample = ((content.top + y) * width + sampleLeft) * 4, rightSample = ((content.top + y) * width + sampleRight) * 4;
+      for (let x = 0; x < content.width; x++) {
+        const pixel = (y * content.width + x) * 4;
+        const ratio = (content.left + x - sampleLeft) / Math.max(1, sampleRight - sampleLeft);
+        const background = [0, 1, 2].map(channel => data[leftSample + channel] * (1 - ratio) + data[rightSample + channel] * ratio);
+        let coverage = 0;
+        for (let channel = 0; channel < 3; channel++) {
+          const difference = body[pixel + channel] - background[channel];
+          coverage = Math.max(coverage, difference >= 0 ? difference / Math.max(1, 255 - background[channel]) : -difference / Math.max(1, background[channel]));
+        }
+        coverage = Math.min(1, coverage);
+        if (coverage < 0.01) { body[pixel + 3] = 0; continue; }
+        for (let channel = 0; channel < 3; channel++) body[pixel + channel] = Math.max(0, Math.min(255, Math.round(background[channel] + (body[pixel + channel] - background[channel]) / coverage)));
+        body[pixel + 3] = Math.round(body[pixel + 3] * coverage);
+      }
+    }
     // 光学内边距按可见字形计量；底部多保留一段，以免裁掉字母下伸部。
-    layers.push({ input: await sharp(buffer).extract(content).resize(contentW, contentH).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra + headerHeight });
+    layers.push({ input: await sharp(body, { raw: { width: content.width, height: content.height, channels: 4 } }).resize(contentW, contentH).png().toBuffer(), left: content.left + extra, top: content.top + offsetY + extra + headerHeight });
     if (header) {
       const left = bodyLeft + Math.round(18 * scale), top = bubble.top + offsetY + Math.round(18 * scale);
       if (header.tagWidth) {
@@ -833,9 +853,7 @@ async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefi
       const left = content.left + extra + Math.round((thumbX - content.left) * contentScale);
       const top = content.top + offsetY + extra + headerHeight + Math.round((thumbY - content.top) * contentScale), radius = Math.max(1, Math.round(4 * scale * contentScale));
       // 先擦除占位环，透明贴纸的空白处不能透出原来的 story 图案。
-      const sampleX = Math.min(width - 1, thumbX + Math.round(43 * scale)), sampleY = Math.min(height - 1, thumbY + Math.round(20 * scale));
-      const sample = (sampleY * width + sampleX) * 4;
-      layers.push({ input: Buffer.from(`<svg width="${size}" height="${size}"><rect width="${size}" height="${size}" rx="${radius}" fill="rgb(${data[sample]},${data[sample + 1]},${data[sample + 2]})"/></svg>`), left, top });
+      layers.push({ input: await sharp(Buffer.from(svg)).extract({ left, top, width: size, height: size }).png().toBuffer(), left, top });
       await addImage(replyImage, left, top, size, size, radius);
     }
     // 头像只移动到底部，大小和内容保持原样。
@@ -854,18 +872,16 @@ async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefi
         if (protectedImages.some(image => x >= image.left && x < image.left + image.width && y >= image.top && y < image.top + image.height)) continue;
         const mask = finishMask[pixel] * finishMask[pixel + 3] / (255 * 255);
         const brightest = Math.max(output[pixel], output[pixel + 1], output[pixel + 2]);
-        // 保留文字、昵称和标签的亮色；背景用宽柔光和轻微透光呈现玻璃层次。
+        // 保留文字、昵称和标签的亮色，只给背景增加很浅的柔光和少量透光。
         const weight = mask * Math.max(0, Math.min(1, (86 - brightest) / 26));
         if (!weight) continue;
-        const u = (x - region.left) / region.width, v = (y - region.top) / region.height;
-        const softLight = 9 * Math.exp(-Math.pow((u - 0.18) / 0.8, 2) - Math.pow((v - 0.12) / 0.65, 2))
-          + 2 * Math.exp(-Math.pow((u - 0.86) / 0.45, 2) - Math.pow((v - 0.82) / 0.7, 2));
+        const v = (y - region.top) / region.height;
+        const softLight = 0.7 + 0.8 * v;
         // 固定的细颗粒，避免每次生成出现不同强度的噪点。
         const hash = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
-        const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 0.6;
+        const grain = ((Math.imul(hash ^ (hash >>> 13), 1274126177) >>> 0) / 4294967295 - 0.5) * 0.2;
         const lift = (softLight + grain) * weight;
-        // 少量压黑并减半透光，描边、高光和亮色文字仍沿用原效果。
-        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round((output[pixel + channel] + lift) * (1 - 0.04 * weight))));
+        for (let channel = 0; channel < 3; channel++) output[pixel + channel] = Math.max(0, Math.min(255, Math.round(output[pixel + channel] + lift)));
         output[pixel + 3] = Math.round(output[pixel + 3] * (1 - 0.035 * weight));
       }
     }
@@ -1441,7 +1457,7 @@ class YvluPlugin extends Plugin {
             // 只修改本次渲染副本，避免 n/t/局部引用影响后续组合或原消息对象。
             let messageText = message.message || "", messageEntities = message.entities || [];
             // ================= 自定义文字覆盖逻辑 (合并项) =================
-            // i === 0 意味着这是你刚刚 Reply 对准的那条消息
+            // 单条组合也走这里；多条时只覆盖第一条所选消息，跳选不一定从回复对象开始。
             if (i === 0) {
               let replyTo = (trigger || msg)?.replyTo;
               if (customText) {
@@ -1534,11 +1550,12 @@ class YvluPlugin extends Plugin {
 
             // 文本和媒体共用本地玻璃合成；下载失败直接报告，不静默漏掉图片。
             const media = await getQuoteMediaPreview(message);
+            const senderTag = shouldShowAvatar ? await getQuoteSenderTag(message, sender, client, participantCache) : {};
 
             items.push({
-              ...(shouldShowAvatar ? customTag !== undefined && currentUserIdentifier === firstSenderIdentifier
-                ? { senderTag: customTag, senderTagRole: "member" }
-                : await getQuoteSenderTag(message, sender, client, participantCache) : {}),
+              ...(shouldShowAvatar && customTag !== undefined && currentUserIdentifier === firstSenderIdentifier
+                ? { ...senderTag, senderTag: customTag, senderTagRole: senderTag.senderTagRole || "member" }
+                : senderTag),
               from: {
                 id: userId ? parseInt(userId) : hashCode(sender.name || `${firstName}|${lastName}`),
                 name: shouldShowAvatar ? name : "",

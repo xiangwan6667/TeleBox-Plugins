@@ -10,5 +10,16 @@
 
 # 禁止提交机密、会话与运行数据
 .env
+.env.*
+!.env.example
+!.env.sample
 config.json
 assets/
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+
+# 本地参考截图
+/codex-clipboard-*.png
+/ChatGPT 图像*.png

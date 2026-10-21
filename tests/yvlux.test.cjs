@@ -47,9 +47,10 @@ const axios = async options => {
   }
   if (realisticQuote || options.data.messages.length) {
     let y=10;const parts=[];const rows=omitMessage&&options.data.messages.length>1?options.data.messages.filter((_,index)=>index!==1):options.data.messages;
+    const [surfaceLeft,surfaceRight]=(options.data.backgroundColor||'#241e2d/#392f45').split('/');
     rows.forEach((row,index)=>{
       const h=row.replyMessage?115:64,w=(row.text||'').length<5?65:260;
-      parts.push(`<rect x="80" y="${y}" width="${w}" height="${h}" rx="13" fill="#302737"/><rect x="96" y="${y+15}" width="10" height="15" fill="white"/>`);
+      parts.push(`<defs><linearGradient id="surface${index}" gradientUnits="userSpaceOnUse" x1="80" y1="${y}" x2="${80+w}" y2="${y+h}"><stop stop-color="${surfaceLeft}"/><stop offset="1" stop-color="${surfaceRight||surfaceLeft}"/></linearGradient></defs><rect x="80" y="${y}" width="${w}" height="${h}" rx="13" fill="url(#surface${index})"/><rect x="96" y="${y+15}" width="10" height="15" fill="white"/>`);
       if(row.replyMessage?.media?.kind==='story')parts.push(`<circle cx="128" cy="${y+44}" r="20" fill="#ff77bb"/>`);
       if((index===rows.length-1||row.from.id!==rows[index+1].from.id)&&!(omitAvatars&&rows.length>1))parts.push(`<circle cx="25" cy="${y+h-25}" r="25" fill="#77bbff"/>`);
       if(joinBubbles&&rows.length>1&&index<rows.length-1)parts.push(`<rect x="100" y="${y+h-1}" width="20" height="10" fill="#302737"/>`);
@@ -87,7 +88,7 @@ const plugin = exportsObj.default;
 plugin.config = {apiUrl: '', stickerSetShortName: ''};
 const generate=plugin.generateQuote.bind(plugin);
 plugin.generateQuote=async data=>{quoteInputs.push(data);return generate(data);};
-const sender = {id: 7, firstName: 'GoMami', color: {color: 6}};
+const sender = {id: 7, firstName: '示例用户甲', color: {color: 6}};
 const message = (id, text, who = sender) => ({id, message: text, peerId: 1, entities: [], getSender: async () => who});
 async function artworkBounds(buffer) {
   const {data,info}=await sharp(buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
@@ -126,7 +127,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(quoteRequests.length, expectedImages);
   assert.equal(sent.length, expectedImages);
   assert.equal(quoteRequests[0].data.style, 'glass');
-  assert.equal(quoteRequests[0].data.backgroundColor, '#302737/#221d2a');
+  assert.equal(quoteRequests[0].data.backgroundColor, '#241e2d/#392f45');
   assert.equal(sent[0].replyTo, messages[0].id);
   for(const file of sent){
     const {info}=await assertQuoteSticker(file.bytes);
@@ -137,7 +138,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
 }
 (async () => {
   responseData = await sharp({create: {width: 320, height: 160, channels: 4, background: '#302737'}}).webp({lossless:true}).toBuffer();
-  let req = await run('.yvlux', [message(10, '小炸不算炸')]);
+  let req = await run('.yvlux', [message(10, '这是一条测试语录')]);
   assert.equal(req.url, 'https://quote.yuri.ly/generate.webp');
   assert.equal(req.data.width,416,'short body lines use a narrower measure for larger text');
   assert.equal(req.data.messages[0].from.accentColorId, 6);
@@ -145,13 +146,13 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   req = await run('.yvlux',[message(10,longText)]);
   assert.equal(req.data.width,512,'long bodies retain the original line measure instead of truncating earlier');
   assert.equal(req.data.messages[0].text,longText);
-  req = await run('.yvlux', [{...message(10, '带成员标签'), peerId:new Api.PeerChannel({channelId: 1}), fromRank:'香香软软小男娘'}]);
+  req = await run('.yvlux', [{...message(10, '带成员标签'), peerId:new Api.PeerChannel({channelId: 1}), fromRank:'测试成员标签甲'}]);
   assert.equal(req.data.messages[0].senderTag, undefined,'backend header disabled');
-  assert.equal((await exportsObj._tag({peerId:new Api.PeerChannel({channelId:1}),fromRank:'香香软软小男娘'},sender,client,new Map())).senderTagRole,'member','plain unboxed tag preset');
+  assert.equal((await exportsObj._tag({peerId:new Api.PeerChannel({channelId:1}),fromRank:'测试成员标签甲'},sender,client,new Map())).senderTagRole,'member','plain unboxed tag preset');
   req = await run('.yvlux 3', [message(10, '第一条'), message(12, '第二条'), message(19, '第三条', {id: 8, firstName: 'Another'})]);
   const same = req.data.messages[1];
   assert.equal(same.from.name, false);
-  assert.equal(same.from.first_name, 'GoMami');
+  assert.equal(same.from.first_name, '示例用户甲');
   assert.equal(same.from.photo, undefined, 'inline avatars stay local');
   assert.equal(req.data.messages[2].from.first_name, 'Another');
   assert.equal(req.data.messages[2].from.name, false,'full header is composed locally for every sender');
@@ -191,7 +192,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(metadata.format, 'webp');
   assert.equal(metadata.height, 512);
   assert.ok(metadata.width <= 512);
-  const fixture = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="240"><rect x="80" y="10" width="260" height="120" rx="26" fill="#302737" stroke="#808080" stroke-width="2"/><rect x="100" y="38" width="20" height="20" fill="#ffffff"/><circle cx="25" cy="101" r="25" fill="#ff4444"/></svg>')).webp({lossless:true}).toBuffer();
+  const fixture = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="512" height="240"><defs><linearGradient id="surface" gradientUnits="userSpaceOnUse" x1="80" y1="10" x2="340" y2="130"><stop stop-color="#241e2d"/><stop offset="1" stop-color="#392f45"/></linearGradient></defs><rect x="80" y="10" width="260" height="120" rx="26" fill="url(#surface)" stroke="#808080" stroke-width="2"/><rect x="100" y="38" width="20" height="20" fill="#ffffff"/><circle cx="25" cy="101" r="25" fill="#ff4444"/></svg>')).webp({lossless:true}).toBuffer();
   const expanded = await exportsObj._expand(fixture);
   const readable = await exportsObj._expand(fixture,[],[],false,1.18);
   const bodyGlyph = async buffer => {
@@ -213,7 +214,18 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(pixel(afterPixels,182,10)[3],255,'highlight stays on the top edge');
   assert.deepEqual(pixel(afterPixels,25,105), pixel(beforePixels,25,101), 'avatar moves down without scaling');
   assert.equal(pixel(beforePixels,342,70)[3],0);
-  assert.equal(pixel(afterPixels,342,70)[3],255,'bubble padding increases slightly');
+  assert.ok(pixel(afterPixels,342,70)[3]>=240,'bubble padding increases slightly while retaining the subtle glass translucency');
+  assert.ok(pixel(afterPixels,300,90)[2]-pixel(afterPixels,140,90)[2]>=10,'purple surface gently brightens toward the right');
+  const surface= pixel(afterPixels,182,20), nearTop=pixel(afterPixels,182,12);
+  assert.ok(Math.max(...nearTop.slice(0,3).map((value,index)=>Math.abs(value-surface[index])))<8,'top highlight is a thin edge instead of a broad glossy band');
+  const aboveContent=pixel(afterPixels,250,23), insideContent=pixel(afterPixels,250,24);
+  assert.ok(Math.max(...aboveContent.slice(0,3).map((value,index)=>Math.abs(value-insideContent[index])))<=3,'reused text backdrop joins the new surface without a visible seam');
+  const surfaceHeaderFixture=await sharp(Buffer.from('<svg width="1000" height="40"><rect x="0" width="1000" height="40" fill="white"/></svg>')).png().toBuffer();
+  const wideSurface=await exportsObj._expand(fixture,[{buffer:surfaceHeaderFixture,tagLeft:1000,tagWidth:0}],[{media:{url:'data:image/png;base64,'+mediaFixture.toString('base64')}}],false);
+  const {data:widePixels,info:wideInfo}=await sharp(wideSurface).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+  const widePixel=(x,y)=>[...widePixels.subarray((y*wideInfo.width+x)*4,(y*wideInfo.width+x)*4+3)];
+  const expandedAbove=widePixel(250,55),expandedInside=widePixel(250,56);
+  assert.ok(Math.max(...expandedAbove.map((value,index)=>Math.abs(value-expandedInside[index])))<=3,'wide names and tall photos use one continuous gradient behind the old text rectangle');
   const avatarImage=await sharp({create:{width:20,height:20,channels:4,background:'#89abcc'}}).png().toBuffer();
   const realAvatar=await exportsObj._restore(expanded,[{avatar:true,from:{photo:{url:'data:image/png;base64,'+avatarImage.toString('base64')}}}]);
   const restoredPixels=await sharp(realAvatar).ensureAlpha().raw().toBuffer();
@@ -247,12 +259,12 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   let lookups = 0;
   const tagClient = {
     getInputEntity: async e => e === peer ? {channelId:20, accessHash:123} : {userId:e.id},
-    invoke: async request => {lookups++;return {participant:{className:'ChannelParticipant',rank:'萝卜宝贝的镇北王'}};},
+    invoke: async request => {lookups++;return {participant:{className:'ChannelParticipant',rank:'测试成员的较长头衔'}};},
   };
   let cache = new Map();
   const plain = {peerId:peer};
   let tag = await exportsObj._tag(plain,sender,tagClient,cache);
-  assert.equal(tag.senderTag,'萝卜宝贝的镇北王');
+  assert.equal(tag.senderTag,'测试成员的较长头衔');
   await exportsObj._tag(plain,sender,tagClient,cache);
   assert.equal(lookups,1,'participant lookup cached per generation');
   assert.equal(Object.keys(await exportsObj._tag({...plain,fwdFrom:{}},sender,tagClient,cache)).length,0,'forwarded author does not inherit forwarding member tag');
@@ -264,8 +276,43 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal((await exportsObj._tag(basic,sender,basicClient,cache)).senderTag,'群主');
   assert.equal((await exportsObj._tag(basic,{id:8},basicClient,cache)).senderTag,'可爱成员');
   assert.equal(lookups,1,'basic group member list loaded once');
-  const fullName='Wan 13:10 ☁19°C 🌸 这是一个需要完整显示的很长用户名 END';
-  const fullTag='萝卜宝贝的镇北王';
+  for(const kind of ['ChannelParticipantAdmin','ChannelParticipantCreator']){
+    let adminLookups=0;
+    const adminClient={getInputEntity:tagClient.getInputEntity,invoke:async()=>{adminLookups++;return {participant:{className:kind,rank:'自定义管理头衔'}};}};
+    const adminCache=new Map();
+    const adminTag=await exportsObj._tag({...plain,fromRank:'消息里的头衔'},sender,adminClient,adminCache);
+    assert.equal(adminTag.senderTag,'消息里的头衔');assert.equal(adminTag.senderTagRole,'admin','administrator and owner roles are recognized even with a message tag');
+    assert.equal((await exportsObj._tag(plain,sender,adminClient,adminCache)).senderTagRole,'admin');assert.equal(adminLookups,1,'role lookup is cached per sender');
+  }
+  const failedRole=await exportsObj._tag({...plain,fromRank:'保留的标签'},sender,{getInputEntity:async()=>{throw Error('forbidden');}},new Map());
+  assert.equal(failedRole.senderTag,'保留的标签');assert.equal(failedRole.senderTagRole,'member','unknown role does not receive administrator coloring');
+  assert.equal((await exportsObj._tag(basic,sender,basicClient,cache)).senderTagRole,'admin','basic-group creator also has administrator coloring');
+  const sameHeader={avatar:true,from:{id:222,name:'测试姓名'},senderTag:'管理头衔'};
+  const [memberStyle]=await exportsObj._headers([{...sameHeader,senderTagRole:'member'}]);
+  const [adminStyle]=await exportsObj._headers([{...sameHeader,senderTagRole:'admin'}]);
+  const [memberCached]=await exportsObj._headers([{...sameHeader,senderTagRole:'member'}]);
+  assert.equal(memberCached,memberStyle,'header cache separates role colors for otherwise identical names and tags');
+  const greenTagPixels=async header=>{
+    const {data,info}=await sharp(header.buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});let count=0;
+    for(let y=0;y<info.height;y++)for(let x=header.tagLeft;x<info.width;x++){
+      const i=(y*info.width+x)*4;
+      if(data[i+3]>128&&data[i+1]>data[i]+40&&data[i+1]>data[i+2]+30)count++;
+    }
+    return count;
+  };
+  assert.ok(await greenTagPixels(adminStyle)>10,'administrator tag is actually rendered with green pixels');
+  assert.equal(await greenTagPixels(memberStyle),0,'ordinary member tag stays muted');
+  const namePart=async header=>sharp(header.buffer).extract({left:0,top:0,width:header.tagLeft,height:(await sharp(header.buffer).metadata()).height}).raw().toBuffer();
+  assert.deepEqual(await namePart(adminStyle),await namePart(memberStyle),'administrator color applies only to the tag');
+  const originalInputEntity=client.getInputEntity,originalInvoke=client.invoke;
+  client.getInputEntity=tagClient.getInputEntity;
+  client.invoke=async()=>({participant:{className:'ChannelParticipantAdmin',rank:'管理头衔'}});
+  try{
+    await run('.yvlux g "自定义管理标签"',[{...message(10,'测试正文'),peerId:peer,fromRank:'原标签'}]);
+    assert.equal(quoteInputs[0].messages[0].senderTag,'自定义管理标签');assert.equal(quoteInputs[0].messages[0].senderTagRole,'admin','g changes the title while preserving the actual administrator role');
+  }finally{client.getInputEntity=originalInputEntity;client.invoke=originalInvoke;}
+  const fullName='示例用户 13:10 ☁19°C 🌸 这是一个需要完整显示的很长用户名 END';
+  const fullTag='测试成员的较长头衔';
   const headerMessages=[{avatar:true,from:{id:123456,name:fullName,first_name:fullName,accentColorId:6},senderTag:fullTag,senderTagRole:'member'}];
   requests=[];
   const [fullHeader]=await exportsObj._headers(headerMessages);
@@ -284,7 +331,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   const assembledMeta=await sharp(assembled).metadata();
   assert.equal(Math.max(assembledMeta.width,assembledMeta.height),512,'whole quote scales into sticker bounds');
   assert.ok(assembledMeta.height<240,'long single-line header widens the quote and scales all text together');
-  const [rightHeader]=await exportsObj._headers([{avatar:true,from:{id:123,name:'良民'},senderTag:'1.8cm'}]);
+  const [rightHeader]=await exportsObj._headers([{avatar:true,from:{id:123,name:'测试姓名'},senderTag:'测试标签'}]);
   const headerFixture=async bubbleWidth=>sharp(Buffer.from(`<svg width="600" height="240"><rect x="80" y="10" width="${bubbleWidth}" height="120" rx="26" fill="#302737"/><circle cx="25" cy="101" r="25" fill="#ff4444"/></svg>`)).png().toBuffer();
   const headerInk=async buffer=>{
     const {data,info}=await sharp(buffer).ensureAlpha().raw().toBuffer({resolveWithObject:true});
@@ -314,10 +361,27 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.equal(spacedRequest.data.messages[0].text,'new body text');assert.equal(spacedRequest.data.messages[0].from.first_name,'New Name');assert.equal(quoteInputs[0].messages[0].senderTag,'Group Tag');
   await run('.yvlux n\u200b 111 t\u200e 111 \u2066g\u2069 111',[message(10,'原文')]);
   if(comboLive){
-    await run('.yvlux n 良民 g 1.8cm',[message(10,'完全符合需求')]);
+    await run('.yvlux n 测试姓名 g 测试标签',[message(10,'这是一条测试正文')]);
     if(process.env.YVLUX_PREVIEW_DIR)await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-right-tag.png'));
     liveQuote=false;
   }
+  const singleAuthor={id:910,firstName:'原始测试姓名',color:{color:5}};
+  const singleCombinationSource={...message(10,'原始测试正文',singleAuthor),peerId:new Api.PeerChannel({channelId:99}),fromRank:'原始测试标签',isReply:true,getReplyMessage:async()=>message(9,'引用测试正文')};
+  const checkSingleCombination=async(selector,flags)=>{
+    const options=[selector,flags&1?'r':'',flags&2?'n "组合测试姓名"':'',flags&4?'t "组合测试正文"':'',flags&8?'g "组合测试标签"':''].filter(Boolean);
+    const sources=selector==='p 2'?[message(8,'未选中的测试正文'),singleCombinationSource]:[singleCombinationSource];
+    await run('.yvlux '+options.join(' '),sources);
+    const selected=quoteInputs.flatMap(batch=>batch.messages);
+    assert.equal(selected.length,1,'combination options never imply a multi-message selection');
+    assert.equal(selected[0].text,flags&4?'组合测试正文':'原始测试正文');
+    assert.equal(selected[0].from.first_name,flags&2?'组合测试姓名':'原始测试姓名');
+    assert.equal(selected[0].senderTag,flags&8?'组合测试标签':'原始测试标签');
+    assert.equal(selected[0].replyMessage?.text,flags&1?'引用测试正文':undefined);
+    assert.equal(singleCombinationSource.message,'原始测试正文');assert.equal(singleAuthor.firstName,'原始测试姓名','single-message overrides do not mutate Telegram source objects');
+  };
+  for(let flags=0;flags<16;flags++)await checkSingleCombination('',flags);
+  for(const selector of ['1','p 2'])await checkSingleCombination(selector,15);
+  console.log('PASS: 18 single-message generation combinations, including all r/n/t/g subsets, explicit count 1, and selecting just the second message.');
   for(const order of [['n','t','g'],['n','g','t'],['t','n','g'],['t','g','n'],['g','n','t'],['g','t','n']]){
     for(const selector of ['','5','p 1,6,8'])for(const reply of ['','r']){
       const options=exportsObj._parse([selector,...order.map(option=>`${option} 111`),reply].filter(Boolean).join(' '));
@@ -401,7 +465,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   for(const emoji of ['🇨🇳','👨‍👩‍👧‍👦','1️⃣','❤️','🏳️‍🌈','👍🏽'])assert.equal(exportsObj._body({text:emoji}),emoji+'\u200b',`normal bubble for ${emoji}`);
   for(const text of ['123','普通文字','👍 好'])assert.equal(exportsObj._body({text}),text);
   requests=[];omitMessage=true;
-  const fallbackPayload={type:'quote',format:'webp',style:'glass',backgroundColor:'#302737/#221d2a',width:512,height:768,scale:2,messages:[
+  const fallbackPayload={type:'quote',format:'webp',style:'glass',backgroundColor:'#241e2d/#392f45',width:512,height:768,scale:2,messages:[
     {avatar:true,from:{id:991,first_name:'Author A',photo:{url:'data:image/png;base64,'+mediaFixture.toString('base64')}},senderTag:'标签 A',text:'甲'},
     {avatar:false,from:{id:991},text:'乙'},
     {avatar:true,from:{id:992,first_name:'Author B'},senderTag:'标签 B',text:'丙'},
@@ -451,6 +515,8 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   let compactHelp='';
   await plugin.cmdHandlers.yvlux({message:'.yvlux help',edit:async options=>{compactHelp=options.text;}});
   assert.match(compactHelp,/g "标签"/);assert.match(compactHelp,/组合示例/);assert.equal(plugin.description,compactHelp);
+  assert.match(compactHelp,/单条、多条均可组合/);assert.match(compactHelp,/多条时 n\/g/);
+  assert.match(compactHelp,/<code>\.yvlux n "名字" g "标签" t "正文"<\/code>/,'help includes a complete single-message combination');
   assert.ok(compactHelp.replace(/<[^>]+>/g,'').length<450,'help stays compact');assert.doesNotMatch(compactHelp,/增强版|高光|本地合成|旧接口|后端/);
   console.log('PASS: numeric n/t/g command, 36 option orders, spaced/smart-quoted/copied options, right-aligned plain tags, all 48 r/n/t/g selector combinations, author scope, and compact help.');
   if(process.argv.includes('--layout-only'))return;
@@ -537,7 +603,7 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   await run('.yvlux r',[reply]);assert.equal(quoteInputs[0].messages[0].replyMessage.text,'节选文字','partial quote retains text and thumbnail together');
   if(live&&process.env.YVLUX_PREVIEW_DIR)await sharp(sent[0].bytes).flatten({background:'#0e1621'}).png().toFile(path.join(process.env.YVLUX_PREVIEW_DIR,'yvlux-fixed-image-reply.png'));
   await run('.yvlux p 2,4 r n "只改 Beta" t "跳选正文"',[photoSource,reply,message(14,'skip'),message(17,'Alpha 原名')]);
-  assert.equal(quoteInputs[0].messages[0].from.first_name,'只改 Beta');assert.equal(quoteInputs[0].messages[1].from.first_name,'GoMami');
+  assert.equal(quoteInputs[0].messages[0].from.first_name,'只改 Beta');assert.equal(quoteInputs[0].messages[1].from.first_name,'示例用户甲');
   liveQuote=false;realisticQuote=false;
   console.log(`PASS: ${matrixCases} complete mode combinations (${live?'real drawing API':'local image fixtures'}), glass material, local photos, photo-only replies, tags, rename scope, immutable source messages, and five-message limit.`);
   // s/config/api/help 路由以及真正的上传文件/文档类型；不连接 Telegram。
