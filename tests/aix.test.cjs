@@ -61,7 +61,7 @@ exportsObj.MessageUtils.prototype.sendImages = async function (_msg, images, cap
 async function run(args, options = {}) {
   sent = undefined;
   const avatars = new Map([[11, options.replyAvatar], [22, options.senderAvatar], ...(options.avatars || [])]);
-  const downloads = [], mediaDownloads = [], edits = [], optimizations = [], statuses = [], tokens = [], fileUploads = [], historyRequests = [];
+  const downloads = [], mediaDownloads = [], edits = [], optimizations = [], statuses = [], tokens = [], fileUploads = [], historyRequests = [], albumRequests = [];
   let textGenerations = 0, releases = 0;
   const status = {delete: async () => {}};
   const attached = options.attached || [];
@@ -99,7 +99,11 @@ async function run(args, options = {}) {
       fileUploads.push({...options, bytes: files.map(file => fs.readFileSync(file))});
     },
     deleteMessages: async () => {},
-    async *iterMessages() {yield* attached;},
+    async *iterMessages(_, request) {
+      albumRequests.push(request);
+      yield* options.replyAlbum || [];
+      yield* attached;
+    },
     getMessages: async (_, request) => {
       historyRequests.push(request);
       if (options.cancelDuringHistory) {
@@ -113,7 +117,9 @@ async function run(args, options = {}) {
   const reply = new Api.Message({
     id: 10, senderId: 11, peerId: 1, client,
     // The replied-to photo must not replace either avatar in aa mode.
-    media: new Api.MessageMediaPhoto({}), testImage: options.extraImage,
+    message: options.replyText || '', groupedId: options.replyGroupedId,
+    media: options.replyMedia === undefined ? new Api.MessageMediaPhoto({}) : options.replyMedia,
+    testImage: options.replyImage === undefined ? options.extraImage : options.replyImage,
   });
   const msg = new Api.Message({
     id: options.commandId || 20, senderId: 22, peerId: 1, client,
@@ -122,6 +128,7 @@ async function run(args, options = {}) {
     edit: async ({text}) => {assert.ok(text.length < 4096, 'edited status fits within Telegram limits'); return status;}, delete: async () => {},
   });
   for (const item of options.history || []) Object.assign(item, {client, peerId: 1});
+  for (const item of options.replyAlbum || []) Object.assign(item, {client, peerId: 1});
   if (attached.length) {
     msg.groupedId = 100;
     for (const item of attached) Object.assign(item, {groupedId: 100, client, peerId: 1});
@@ -168,7 +175,7 @@ async function run(args, options = {}) {
   const feature = new exportsObj.ImageFeature(ai, Promise.resolve({getConfig: () => config}), {});
   let error;
   try {await feature.execute(msg, args, ['.']);} catch (e) {error = e;}
-  return {error, downloads, mediaDownloads, edits, optimizations, statuses, tokens, fileUploads, historyRequests, sent, textGenerations, releases};
+  return {error, downloads, mediaDownloads, edits, optimizations, statuses, tokens, fileUploads, historyRequests, albumRequests, sent, textGenerations, releases};
 }
 
 async function assertAvatarOrder(image, expected = [[255, 0, 0], [0, 0, 255]]) {
@@ -230,6 +237,88 @@ async function assertAvatarOrder(image, expected = [[255, 0, 0], [0, 0, 255]]) {
   const album = count => Array.from({length: count}, (_, i) => new Api.Message({
     id: 20 + i, media: new Api.MessageMediaPhoto({}), testImage: extraImage,
   }));
+  const publisherText = '今天不想上班\n只想摸鱼 & 休息';
+  const publisher = {...options, replyText: publisherText, replyMedia: null};
+  result = await run(['image', 'ac', '根据原话画表情包'], publisher);
+  assert.ifError(result.error);
+  assert.deepEqual(result.downloads, [11], 'ac uses the replied-to publisher avatar');
+  assert.deepEqual(result.mediaDownloads, [], 'text posts do not need media downloads');
+  assert.equal(result.optimizations.length, 0, 'publisher content also works without prompt optimization');
+  assert.match(result.edits[0].prompt, /IMAGE A.*发布者的头像/);
+  assert.ok(result.edits[0].prompt.includes(publisherText), 'preserve literal text and line breaks in the generation request');
+  assert.match(result.edits[0].prompt, /根据原话画表情包/);
+  assert.equal((await sharp(result.edits[0].image.data).metadata()).width, 512);
+  result = await run(['image', 'ac'], publisher);
+  assert.ifError(result.error);
+  assert.match(result.edits[0].prompt, /参考发布者头像和这条消息的内容创作图片/);
+  assert.ok(result.edits[0].prompt.includes(publisherText));
+  result = await run(['image', 'ac', '--n', '2', '根据内容画两张表情包'], {...publisher, optimize: true});
+  assert.ifError(result.error);
+  assert.equal(result.optimizations.length, 1);
+  assert.ok(result.optimizations[0].prompt.includes(publisherText));
+  assert.equal(result.edits.length, 2);
+  for (const edit of result.edits) assert.ok(edit.prompt.includes(publisherText), 'optimized prompts retain the original publisher context');
+  result = await run(['image', 'avatar-content', '保留原话'], {...publisher, optimize: true, failFirstEdit: true});
+  assert.ifError(result.error);
+  assert.equal(result.edits.length, 2);
+  assert.equal(result.edits[0].image, result.edits[1].image);
+  assert.ok(result.edits[1].prompt.includes(publisherText), 'fallback must retain publisher text');
+  assert.match(result.edits[1].prompt, /保留原话/);
+
+  result = await run(['image', 'ac', '结合头像和图片'], {...options, replyText: '发布的图片说明'});
+  assert.ifError(result.error);
+  assert.deepEqual(result.mediaDownloads, [10]);
+  await assertAvatarOrder(result.edits[0].image, [[255, 0, 0], [0, 255, 0]]);
+  assert.match(result.edits[0].prompt, /IMAGE B.*发布者消息中的图片或贴纸/);
+  assert.match(result.edits[0].prompt, /发布的图片说明/);
+  result = await run(['image', '头像内容'], {
+    ...options, replyMedia: new Api.MessageMediaDocument({document: new Api.Document({mimeType: 'image/webp', attributes: []})}),
+    replyImage: await sharp(extraImage).webp({lossless: true}).toBuffer(),
+  });
+  assert.ifError(result.error);
+  assert.deepEqual(result.mediaDownloads, [10]);
+  await assertAvatarOrder(result.edits[0].image, [[255, 0, 0], [0, 255, 0]]);
+
+  const publisherAlbum = [
+    new Api.Message({id: 9, groupedId: 77, senderId: 11, message: '相册首条说明', media: new Api.MessageMediaPhoto({}), testImage: extraImage}),
+    new Api.Message({id: 11, groupedId: 77, senderId: 11, message: '相册补充说明', media: new Api.MessageMediaPhoto({}), testImage: senderAvatar}),
+    new Api.Message({id: 12, groupedId: 88, senderId: 22, message: '无关内容，不应发送到模型', media: new Api.MessageMediaPhoto({}), testImage: extraImage}),
+  ];
+  result = await run(['image', 'ac'], {...options, replyGroupedId: 77, replyAlbum: publisherAlbum});
+  assert.ifError(result.error);
+  assert.deepEqual(result.mediaDownloads, [9, 10, 11]);
+  assert.equal(result.albumRequests.length, 1, 'read publisher album text and pictures in one history scan');
+  assert.match(result.edits[0].prompt, /相册首条说明/);
+  assert.match(result.edits[0].prompt, /相册补充说明/);
+  assert.doesNotMatch(result.edits[0].prompt, /无关内容/);
+  assert.match(result.edits[0].prompt, /IMAGE D.*发布者消息中的图片或贴纸/);
+
+  result = await run(['image', 'ac'], {...options, attached: album(4)});
+  assert.ifError(result.error);
+  assert.deepEqual(result.mediaDownloads, [20, 21, 22, 23, 10]);
+  assert.match(result.edits[0].prompt, /IMAGE C.*本次生图命令的附图/);
+  assert.match(result.edits[0].prompt, /IMAGE F.*本次生图命令的附图/);
+  result = await run(['image', 'ac'], {...options, attached: album(5)});
+  assert.match(result.error?.message || '', /发布者头像、消息图片和附图合计最多6张/);
+  assert.equal(result.edits.length, 0);
+  for (const [extra, expected] of [
+    [{noReply: true}, /需要回复/],
+    [{replyAvatar: undefined}, /发布者的头像/],
+    [{replyText: ' \n ', replyMedia: null, attached: album(1)}, /没有可用的文字、图片或贴纸/],
+  ]) {
+    result = await run(['image', 'ac'], {...publisher, ...extra});
+    assert.match(result.error?.message || '', expected);
+    assert.equal(result.edits.length, 0);
+    assert.equal(result.textGenerations, 0, 'never drop the publisher avatar or content requirement');
+  }
+  result = await run(['image', 'ac'], {...options, cancelDuringMedia: true});
+  assert.match(result.error?.message || '', /__AIX_SILENT_CANCEL__/);
+  assert.equal(result.edits.length, 0);
+  assert.equal(result.releases, 1);
+  result = await run(['image', 'a', '头像肖像'], publisher);
+  assert.ifError(result.error);
+  assert.ok(!result.edits[0].prompt.includes(publisherText), 'existing avatar-only mode stays avatar-only');
+
   result = await run(['image', 'aa', '一起喝茶'], {...options, attached: album(4)});
   assert.ifError(result.error);
   assert.equal(result.mediaDownloads.length, 4);
@@ -429,7 +518,7 @@ async function assertAvatarOrder(image, expected = [[255, 0, 0], [0, 0, 255]]) {
   await assert.rejects(exportsObj.runAbortable(async () => {started = true;}, cancelled), /stop/);
   assert.equal(started, false, 'do not start RPCs after cancellation');
   await assert.rejects(exportsObj.runAbortable(() => new Promise(() => {}), undefined, 5), /素材读取超时/);
-  console.log('aix: message-index avatar selection, reference modes, pagination, optimization, timeout delivery, cancellation, retries and long prompts passed');
+  console.log('aix: publisher avatar/content, message-index selection, reference modes, pagination, optimization, timeout delivery, cancellation, retries and long prompts passed');
 })().catch(error => {console.error(error); process.exitCode = 1;}).finally(() => {
   assert.equal(path.dirname(path.resolve(runtimeDir)), tempRoot);
   assert.ok(path.basename(runtimeDir).startsWith('telebox-aix-tests-'));

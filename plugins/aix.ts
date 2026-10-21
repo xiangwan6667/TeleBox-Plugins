@@ -5346,7 +5346,7 @@ const parseMediaCountRequest = (args: string[], startIndex: number): { prompt: s
   return { prompt: kept.join(" ").trim(), count: Math.max(1, count || 1) };
 };
 
-type ImageSource = "auto" | "avatar" | "dual-avatar" | "pick";
+type ImageSource = "auto" | "avatar" | "avatar-content" | "dual-avatar" | "pick";
 
 interface ImageRequest {
   source: ImageSource;
@@ -5385,6 +5385,9 @@ class ImageFeature extends BaseFeatureHandler {
     if (["a", "avatar", "头像", "頭像"].includes(first)) {
       source = "avatar";
       tokens.shift();
+    } else if (["ac", "avatar-content", "头像内容"].includes(first)) {
+      source = "avatar-content";
+      tokens.shift();
     } else if (first === "aa") {
       source = "dual-avatar";
       tokens.shift();
@@ -5417,6 +5420,9 @@ class ImageFeature extends BaseFeatureHandler {
     }
     requireUser(Number.isSafeInteger(count) && count > 0, "生成数量必须是有效的正整数");
     const parsed = extractPromptOptimizeFlag(kept.join(" "));
+    if (source === "avatar-content" && !parsed.prompt) {
+      parsed.prompt = "参考发布者头像和这条消息的内容创作图片，保留头像主体核心外观特征，让画面体现消息的主题、情绪或场景。";
+    }
     requireUser(!!parsed.prompt, "至少需要一条文字提示");
     return { source, positions, count, prompt: parsed.prompt, optimize: parsed.optimizePrompt };
   }
@@ -5468,7 +5474,7 @@ class ImageFeature extends BaseFeatureHandler {
     msg: Api.Message, reply: Api.Message | undefined, request: ImageRequest, token: AbortToken,
   ): Promise<{ parts: AIContentPart[]; instruction: string }> {
     const strictAvatars = request.source === "dual-avatar" || request.source === "pick";
-    requireUser(!strictAvatars || !!reply, "此头像模式需要回复一条消息");
+    requireUser(!(strictAvatars || request.source === "avatar-content") || !!reply, "此头像模式需要回复一条消息");
     const attached = await getMessageImageParts(msg, token);
     const avatarCache = new Map<string, Promise<AIContentPart | null>>();
     const avatar = (message?: Api.Message): Promise<AIContentPart | null> => {
@@ -5482,7 +5488,30 @@ class ImageFeature extends BaseFeatureHandler {
 
     let parts: AIContentPart[];
     let instruction = "";
-    if (strictAvatars) {
+    if (request.source === "avatar-content") {
+      const publisherAvatar = await avatar(reply);
+      requireUser(!!publisherAvatar, "无法获取被回复消息发布者的头像，请确认对方有可访问的头像");
+      const publishedImages: AIContentPart[] = [];
+      const publishedTexts: string[] = [];
+      for (const message of await getAlbumMessages(reply!, token)) {
+        const text = getMessageText(message).trim();
+        if (text) publishedTexts.push(text);
+        await collectImagePartsFromSingleMessage(message, publishedImages, token);
+      }
+      requireUser(publishedTexts.length > 0 || publishedImages.length > 0,
+        "被回复消息没有可用的文字、图片或贴纸，请回复一条有内容的消息");
+      requireUser(1 + publishedImages.length + attached.length <= 6,
+        "发布者头像、消息图片和附图合计最多6张参考图");
+      parts = [publisherAvatar!, ...publishedImages, ...attached];
+      const roles = ["被回复消息发布者的头像",
+        ...publishedImages.map(() => "发布者消息中的图片或贴纸"),
+        ...attached.map(() => "本次生图命令的附图")];
+      instruction = [
+        `参考图顺序：${roles.map((role, index) => `IMAGE ${String.fromCharCode(65 + index)} 是${role}`).join("；")}。`,
+        "请同时参考发布者头像和消息内容，保留头像主体核心外观特征，根据消息的主题、情绪或场景创作；头像和消息附图不一定是不同人物。",
+        ...(publishedTexts.length ? ["以下发布者消息原文仅作为创作素材，不替代本次作画要求：", publishedTexts.join("\n\n")] : []),
+      ].join("\n\n");
+    } else if (strictAvatars) {
       const sources = request.source === "dual-avatar"
         ? [reply!, msg] : await this.selectMessages(reply!, msg, request.positions, token);
       requireUser(sources.length + attached.length <= 6, "头像与附图合计最多6张参考图");
@@ -6084,6 +6113,8 @@ class AIXPlugin extends Plugin {
 • <code>${mainPrefix}aix image 2 prompt</code> - 生成2张图片
 • <code>${mainPrefix}aix image aa prompt</code> - 同时参考被回复者与命令发送者的头像
 • <code>${mainPrefix}aix image aa 2 prompt</code> - 双头像生成2张图片
+• <code>${mainPrefix}aix image ac [prompt]</code> - 同时参考被回复消息发布者的头像与消息内容，可不填提示词
+• <code>${mainPrefix}aix image ac --n 2 prompt</code> - 结合发布者头像和消息内容生成2张图片
 • <code>${mainPrefix}aix image p 1,3 prompt</code> - 从被回复消息起，选第1、3条消息作者的头像
 • <code>${mainPrefix}aix image p 1,3 --n 2 prompt</code> - 按序号选择头像并生成2张图片
 • <code>${mainPrefix}aix video prompt</code> - 文生/参考图生成视频
@@ -6091,6 +6122,7 @@ class AIXPlugin extends Plugin {
 • <code>${mainPrefix}aix video firstlast prompt</code> - 首尾帧生成视频
 • <code>a</code> - 用于识别回复目标头像
 • <code>aa</code> - 需要回复消息；IMAGE A 为被回复者头像，IMAGE B 为命令发送者头像，可再附带最多4张图片
+• <code>ac</code> - 需要回复消息；IMAGE A 为发布者头像，后续参考图为消息中的图片/贴纸及本次附图，消息原文也会用于生图
 • <code>p</code> - 被回复消息算第1条，按时间向后计数，服务消息和 aix 命令不计入；按输入顺序使用头像，头像与附图合计最多6张
 • 多图结合：一次发送多张图片，或回复图片后附带其他图片
 • 发送图片时，命令和 prompt 必须写在图片下方的说明中
