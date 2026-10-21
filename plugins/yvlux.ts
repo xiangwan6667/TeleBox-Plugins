@@ -806,7 +806,8 @@ async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefi
     finishRegions.push({ left: bodyLeft, top: bubble.top + offsetY, width: w, height: h });
     // 从无文字的左右内边距估计原背景，提取文字/引用图层；扩展后的气泡共用完整渐变，避免矩形色块。
     const body = await sharp(buffer).extract(content).ensureAlpha().raw().toBuffer();
-    const sampleLeft = bodyLeft + Math.round(8 * scale), sampleRight = bubble.right - Math.round(8 * scale);
+    // 取样保留在 16px 文字内边距中，同时避开短气泡圆角向内延伸的亮描边。
+    const sampleLeft = bodyLeft + Math.round(12 * scale), sampleRight = bubble.right - Math.round(12 * scale);
     for (let y = 0; y < content.height; y++) {
       const leftSample = ((content.top + y) * width + sampleLeft) * 4, rightSample = ((content.top + y) * width + sampleRight) * 4;
       for (let x = 0; x < content.width; x++) {

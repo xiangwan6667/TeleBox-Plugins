@@ -226,6 +226,19 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   const widePixel=(x,y)=>[...widePixels.subarray((y*wideInfo.width+x)*4,(y*wideInfo.width+x)*4+3)];
   const expandedAbove=widePixel(250,55),expandedInside=widePixel(250,56);
   assert.ok(Math.max(...expandedAbove.map((value,index)=>Math.abs(value-expandedInside[index])))<=3,'wide names and tall photos use one continuous gradient behind the old text rectangle');
+  const shortBubbleRect='x="66" y="4" width="433" height="59" rx="29.5"';
+  const curvedSurfaceFixture=Buffer.from(`<svg width="600" height="160"><defs><linearGradient id="surface" gradientUnits="userSpaceOnUse" x1="66" y1="4" x2="499" y2="63"><stop stop-color="#241e2d"/><stop offset="1" stop-color="#392f45"/></linearGradient><clipPath id="curve"><rect ${shortBubbleRect}/></clipPath></defs><rect ${shortBubbleRect} fill="url(#surface)"/><rect ${shortBubbleRect} fill="none" stroke="white" stroke-opacity=".16" stroke-width="6" clip-path="url(#curve)"/><rect x="100" y="20" width="20" height="20" fill="white"/><circle cx="27.5" cy="36.5" r="27.5" fill="#77bbff"/></svg>`);
+  for(const nativeScale of [1,2])for(const bodyScale of [1,1.18]){
+    const source=await sharp(curvedSurfaceFixture,{density:72*nativeScale}).png().toBuffer();
+    const output=await exportsObj._expand(source,[],[],false,bodyScale);
+    const {data,info}=await sharp(output).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+    let largestStep=0;
+    for(let y=Math.round(48*bodyScale*nativeScale);y<Math.round(57*bodyScale*nativeScale);y++)for(let x=180*nativeScale;x<430*nativeScale;x++){
+      const pixel=(y*info.width+x)*4,next=pixel+info.width*4;
+      for(let channel=0;channel<3;channel++)largestStep=Math.max(largestStep,Math.abs(data[next+channel]-data[pixel+channel]));
+    }
+    assert.ok(largestStep<=3,`body bottom has no dark stripe from the original curved rim (${nativeScale}x source, ${bodyScale}x body): ${largestStep}`);
+  }
   const avatarImage=await sharp({create:{width:20,height:20,channels:4,background:'#89abcc'}}).png().toBuffer();
   const realAvatar=await exportsObj._restore(expanded,[{avatar:true,from:{photo:{url:'data:image/png;base64,'+avatarImage.toString('base64')}}}]);
   const restoredPixels=await sharp(realAvatar).ensureAlpha().raw().toBuffer();
