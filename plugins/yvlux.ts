@@ -790,16 +790,16 @@ async function expandGlassPadding(buffer: Buffer, headers: (QuoteHeader | undefi
     const shape = `M ${rTL} 0 H ${w - rTR} A ${rTR} ${rTR} 0 0 1 ${w} ${rTR} V ${h - rBR} A ${rBR} ${rBR} 0 0 1 ${w - rBR} ${h} ` +
       (tail ? `H ${-tail} C ${-tail * 0.4} ${h} 0 ${h - rBL * 0.3} 0 ${h - rBL}` : `H ${rBL} A ${rBL} ${rBL} 0 0 1 0 ${h - rBL}`) +
       ` V ${rTL} A ${rTL} ${rTL} 0 0 1 ${rTL} 0 Z`;
-    const lw = scale;
+    const lw = 1.5 * scale;
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><defs>
       <linearGradient id="fill" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="${w}" y2="${h}"><stop stop-color="${glassLeft}"/><stop offset="1" stop-color="${glassRight}"/></linearGradient>
-      <linearGradient id="light" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${h * 0.45}"><stop stop-color="white" stop-opacity="0.12"/><stop offset="1" stop-color="white" stop-opacity="0"/></linearGradient>
+      <linearGradient id="light" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${h * 0.45}"><stop stop-color="white" stop-opacity="0.10"/><stop offset="1" stop-color="white" stop-opacity="0"/></linearGradient>
       <clipPath id="bubble"><path d="${shape}"/></clipPath>
       <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${2 * scale}"/></filter>
       </defs><g transform="translate(${bodyLeft} ${bubble.top + offsetY})">
       <path d="${shape}" transform="translate(0 ${scale})" fill="black" opacity="0.18" filter="url(#shadow)"/>
       <path d="${shape}" fill="url(#fill)"/>
-      <g clip-path="url(#bubble)" fill="none"><path d="${shape}" stroke="white" stroke-opacity="0.045" stroke-width="${lw * 2}"/><path d="${shape}" stroke="url(#light)" stroke-width="${lw * 2}"/></g></g></svg>`;
+      <g clip-path="url(#bubble)" fill="none"><path d="${shape}" stroke="white" stroke-opacity="0.06" stroke-width="${lw * 2}"/><path d="${shape}" stroke="url(#light)" stroke-width="${lw * 2}"/></g></g></svg>`;
     layers.push({ input: Buffer.from(svg), left: 0, top: 0 });
     // 材质只作用在气泡内部，避开现有描边和顶部高光。
     finishMasks.push({ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}"><path transform="translate(${bodyLeft} ${bubble.top + offsetY})" d="${shape}" fill="white" stroke="black" stroke-width="${lw * 4}"/></svg>`), left: 0, top: 0 });
