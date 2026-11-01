@@ -14,7 +14,7 @@ const source = fs.readFileSync(path.join(__dirname, '../plugins/aix.ts'), 'utf8'
 // Exercise the real image command without starting the plugin's database/client.
 const compiled = ts.transpileModule(source.replace(
   'export default new AIXPlugin();',
-  'export { ImageFeature, MessageUtils, getMessageImageParts, getGroupedMessageIds, runAbortable, createAbortToken };',
+  'export { AIXPlugin, ConfigManager, ImageFeature, MessageUtils, getMessageImageParts, getGroupedMessageIds, runAbortable, createAbortToken };',
 ), {
   fileName: 'aix.ts', reportDiagnostics: true,
   compilerOptions: {
@@ -24,6 +24,7 @@ const compiled = ts.transpileModule(source.replace(
 });
 assert.equal(compiled.diagnostics.length, 0, 'TypeScript syntax');
 const classes = new Map();
+let activePrefixes = ['.'];
 const Api = new Proxy({}, {get(_, key) {
   if (!classes.has(key)) classes.set(key, class {constructor(args) {Object.assign(this, args);}});
   return classes.get(key);
@@ -34,10 +35,11 @@ vm.runInNewContext(compiled.outputText, {
     if (name === 'sharp') return sharp;
     if (name === 'teleproto') return {Api};
     if (name === '@utils/pluginBase') return {Plugin: class {}};
-    if (name === '@utils/pluginManager') return {getPrefixes: () => ['.']};
+    if (name === '@utils/pluginManager') return {getPrefixes: () => activePrefixes};
     if (name === '@utils/pathHelpers') return {createDirectoryInAssets: () => runtimeDir};
     if (name === '@utils/safeGetMessages') return {safeGetReplyMessage: msg => msg.getReplyMessage()};
-    if (name.startsWith('@utils/') || name === 'axios' || name === 'lowdb/node') return {};
+    if (name === 'axios') return {create: () => async () => ({})};
+    if (name.startsWith('@utils/') || name === 'lowdb/node') return {};
     return require(name);
   },
   exports: exportsObj, Buffer, AbortController, console,
@@ -518,6 +520,39 @@ async function assertAvatarOrder(image, expected = [[255, 0, 0], [0, 0, 255]]) {
   await assert.rejects(exportsObj.runAbortable(async () => {started = true;}, cancelled), /stop/);
   assert.equal(started, false, 'do not start RPCs after cancellation');
   await assert.rejects(exportsObj.runAbortable(() => new Promise(() => {}), undefined, 5), /素材读取超时/);
+  const config = {collapse: false, configs: {}, modelPresets: {}, imagePromptRules: {}, prompt: ''};
+  const manager = {
+    getConfig: () => config, registerListener() {}, unregisterListener() {},
+    updateConfig: async fn => fn(config), destroy: async () => {},
+  };
+  exportsObj.ConfigManager.getInstance = async () => manager;
+  activePrefixes = ['!'];
+  const plugin = new exportsObj.AIXPlugin();
+  let edited = '', question;
+  const command = async text => plugin.cmdHandlers.aix({message: text, getReplyMessage: async () => undefined,
+    edit: async ({text: value}) => {edited = value; return {};}});
+  await command('!aix help');
+  assert.match(edited, /AIX · AI 助手/);
+  assert.match(edited, /!aix config/);
+  assert.match(edited, /!aix prompt rule add/);
+  assert.ok(edited.replace(/<[^>]+>/g, '').length < 4096, 'help fits in one Telegram message');
+  await command('!aix model preset list');
+  assert.match(edited, /!aix model preset add/);
+  await command('!aix prompt');
+  assert.match(edited, /!aix prompt rule add/);
+  for (const [input, model] of [['提问', 'chat'], ['search 提问', 'search'], ['image 提示词', 'image'], ['video 提示词', 'video']]) {
+    await command(`!aix ${input}`);
+    assert.ok(edited.includes(`!aix model ${model}`), `${model} setup guidance uses the correct command`);
+    assert.doesNotMatch(edited, /<tag>|<url>|<key>|<model-path>/, 'setup guidance does not contain invalid HTML tags');
+  }
+  plugin.questionFeature.execute = async (_msg, args) => {question = Array.from(args);};
+  await command('!aix h');
+  assert.deepEqual(question, ['h'], 'ordinary AI input is not intercepted by a new help alias');
+  activePrefixes = [];
+  assert.match(await plugin.description(), /\.aix help/, 'empty prefix list uses the same default as the other plugins');
+  await command('.aix search 提问');
+  assert.match(edited, /\.aix model search/, 'setup guidance also falls back to the default prefix');
+  await plugin.cleanup();
   console.log('aix: publisher avatar/content, message-index selection, reference modes, pagination, optimization, timeout delivery, cancellation, retries and long prompts passed');
 })().catch(error => {console.error(error); process.exitCode = 1;}).finally(() => {
   assert.equal(path.dirname(path.resolve(runtimeDir)), tempRoot);

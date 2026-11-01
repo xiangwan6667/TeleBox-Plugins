@@ -13,7 +13,7 @@
   },
   "ban_ad_spam": {
     "url": "https://github.com/xiangwan6667/TeleBox-Plugins/blob/main/plugins/ban_ad_spam.ts?raw=true",
-    "desc": "别人回复消息并 @你 且包含 ban广告 时，自动对目标消息回复 /spam"
+    "desc": "他人回复消息并 @你 且包含 ban广告 时发起投票，5 分钟内 3 个 👍 后回复 /spam"
   },
   "yvlux": {
     "url": "https://github.com/xiangwan6667/TeleBox-Plugins/blob/main/plugins/yvlux.ts?raw=true",

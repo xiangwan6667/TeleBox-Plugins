@@ -4,6 +4,11 @@ import { getPrefixes } from "@utils/pluginManager";
 
 const mainPrefix = getPrefixes()[0] || ".";
 const MAX_OUTPUT = 3800;
+const helpText = `<b>TJ · 回复统计</b>\n\n` +
+  `<b>使用</b>\n` +
+  `• 回复目标消息发送 <code>${mainPrefix}tj</code> — 统计回复\n` +
+  `• <code>${mainPrefix}tj 消息链接</code> — 统计链接指向的消息\n` +
+  `• <code>${mainPrefix}tj help</code> — 查看帮助`;
 
 type Target = {
   peer: any;
@@ -120,7 +125,7 @@ async function fetchAllReplies(msg: Api.Message, target: Target): Promise<any[]>
 
 class ThreadReplyStatsPlugin extends Plugin {
   name = "tj";
-  description = `统计指定消息的全部回复\n<code>${mainPrefix}tj 链接</code> 或回复消息后发送 <code>${mainPrefix}tj</code>`;
+  description = helpText;
 
   private async reply(msg: Api.Message, text: string): Promise<void> {
     await msg.client.sendMessage(msg.peerId, {
@@ -135,10 +140,15 @@ class ThreadReplyStatsPlugin extends Plugin {
       const parts = text.split(/\s+/).filter(Boolean);
       const argument = parts.slice(1).join(" ");
 
+      if (["help", "h", "?"].includes(argument.toLowerCase())) {
+        await msg.edit({ text: helpText, parseMode: "html", linkPreview: false });
+        return;
+      }
+
       try {
         const target = await resolveTarget(msg, argument);
         if (!target) {
-          await this.reply(msg, `用法：\n<code>${mainPrefix}tj https://t.me/c/1821626401/1686</code>\n或回复目标消息后发送 <code>${mainPrefix}tj</code>`);
+          await this.reply(msg, helpText);
           return;
         }
 

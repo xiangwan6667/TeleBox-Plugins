@@ -292,8 +292,7 @@ function friendlyError(error: any): string {
 
 class StsavePlugin extends Plugin {
   name = "stsave";
-  description = `⭐ 保存贴纸到自己的贴纸包（静态 / 动态 / 视频）\n` +
-    `<code>${mainPrefix}stsave help</code>`;
+  description = this.helpText();
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     stsave: async (msg) => this.handleCommand(msg),
@@ -301,26 +300,27 @@ class StsavePlugin extends Plugin {
   };
 
   private helpText(): string {
-    return `⭐ <b>贴纸保存插件</b>\n\n` +
-      `<b>保存贴纸或转换媒体：</b>\n` +
-      `回复贴纸、图片、GIF 或视频发送 <code>${mainPrefix}stsave</code>\n` +
-      `• 静态贴纸原样保存；普通图片自动转成 512px WebP 静态贴纸。\n` +
-      `• TGS 保留原始矢量 60 FPS；视频/GIF 自动转成 30 FPS VP9 WebM 视频贴纸。\n` +
-      `静态、TGS 和 WebM 三种格式全部保存到同一个混合贴纸包。\n\n` +
-      `<b>指定本次保存到某个包：</b>\n` +
-      `<code>${mainPrefix}stsave to 包短名称</code>\n\n` +
-      `<b>设置唯一目标贴纸包：</b>\n` +
-      `<code>${mainPrefix}stsave set 包短名称</code>\n` +
-      `<code>${mainPrefix}st set 包短名称</code>\n\n` +
-      `<b>恢复自动选包：</b>\n` +
-      `<code>${mainPrefix}stsave auto</code>\n\n` +
-      `<b>其他：</b>\n` +
-      `<code>${mainPrefix}stsave status</code> — 查看设置\n` +
-      `<code>${mainPrefix}stsave emoji ⭐</code> — 设置无标签贴纸的默认表情\n\n` +
-      `未设置固定包时，插件会自动创建一个混合贴纸包。`;
+    return `<b>STSAVE · 贴纸保存</b>\n\n` +
+      `<b>使用</b>\n` +
+      `• 回复贴纸、图片、GIF 或视频发送 <code>${mainPrefix}stsave save</code> — 保存或转换\n` +
+      `• <code>${mainPrefix}stsave to 包短名称</code> — 本次保存到指定包\n` +
+      `• <code>${mainPrefix}stsave help</code> — 查看帮助\n\n` +
+      `<b>配置</b>\n` +
+      `• <code>${mainPrefix}stsave config</code> — 查看配置\n` +
+      `• <code>${mainPrefix}stsave config sticker 包短名称</code> — 设置目标贴纸包\n` +
+      `• <code>${mainPrefix}stsave config auto</code> — 恢复自动选包\n` +
+      `• <code>${mainPrefix}stsave config emoji ⭐</code> — 设置默认表情\n\n` +
+      `静态、TGS 和视频贴纸使用同一个混合贴纸包；视频和 GIF 转换需要 FFmpeg。`;
   }
 
   private async handleCommand(msg: Api.Message): Promise<void> {
+    const parts = (msg.message || msg.text || "").trim().split(/\s+/);
+    let sub = (parts[1] || "").toLowerCase();
+    if (["help", "h", "?"].includes(sub)) {
+      await msg.edit({ text: this.helpText(), parseMode: "html", linkPreview: false });
+      return;
+    }
+
     const client = await getGlobalClient();
     if (!client) {
       await msg.edit({ text: "❌ 客户端未初始化" });
@@ -328,14 +328,16 @@ class StsavePlugin extends Plugin {
     }
 
     try {
-      const parts = (msg.message || msg.text || "").trim().split(/\s+/);
-      const sub = (parts[1] || "").toLowerCase();
-      const config = loadConfig();
-
-      if (sub === "help" || sub === "h") {
-        await msg.edit({ text: this.helpText(), parseMode: "html", linkPreview: false });
-        return;
+      const configStyle = sub === "config";
+      if (configStyle) {
+        parts.splice(1, 1);
+        sub = (parts[1] || "status").toLowerCase();
+        if (sub === "sticker") sub = "set";
+        if (!["status", "set", "auto", "clear", "emoji"].includes(sub)) {
+          throw new Error(`未知配置项：${sub}`);
+        }
       }
+      const config = loadConfig();
 
       if (sub === "status" || (sub === "" && !msg.isReply)) {
         await this.showStatus(msg, config);
@@ -344,7 +346,7 @@ class StsavePlugin extends Plugin {
 
       if (sub === "emoji") {
         const emoji = parts.slice(2).join(" ").trim();
-        if (!emoji) throw new Error("请提供默认表情，例如：.stsave emoji ⭐");
+        if (!emoji) throw new Error(`请提供默认表情，例如：${mainPrefix}stsave config emoji ⭐`);
         config.defaultEmoji = emoji;
         saveConfig(config);
         await msg.edit({ text: `✅ 默认表情已设置为 ${htmlEscape(emoji)}`, parseMode: "html" });
@@ -352,7 +354,7 @@ class StsavePlugin extends Plugin {
       }
 
       if (sub === "set") {
-        const legacyTypeSyntax = ["static", "animated", "video"].includes((parts[2] || "").toLowerCase());
+        const legacyTypeSyntax = !configStyle && ["static", "animated", "video"].includes((parts[2] || "").toLowerCase());
         const packName = normalizePackName(parts[legacyTypeSyntax ? 3 : 2] || "");
         if (!isValidPackName(packName)) {
           throw new Error("贴纸包短名称无效：必须以字母开头，只能包含字母、数字、下划线，长度 3-64");
@@ -375,6 +377,14 @@ class StsavePlugin extends Plugin {
         return;
       }
 
+      let oneTimePack = "";
+      if (sub === "to") {
+        oneTimePack = normalizePackName(parts[2] || "");
+        if (!isValidPackName(oneTimePack)) throw new Error("请提供正确的贴纸包短名称");
+      } else if (sub && sub !== "save") {
+        throw new Error(`未知子命令：${sub}`);
+      }
+
       const replied = await safeGetReplyMessage(msg);
       if (!replied) throw new Error("请回复贴纸、图片、GIF 或视频后再发送命令");
       const detected = detectInput(replied, config.defaultEmoji);
@@ -390,14 +400,6 @@ class StsavePlugin extends Plugin {
         });
         const conversionMode: "image" | "video" = detected.mode === "image" ? "image" : "video";
         sticker = await this.convertAndUploadMedia(client, replied, conversionMode, config.defaultEmoji);
-      }
-
-      let oneTimePack = "";
-      if (sub === "to") {
-        oneTimePack = normalizePackName(parts[2] || "");
-        if (!isValidPackName(oneTimePack)) throw new Error("请提供正确的贴纸包短名称");
-      } else if (sub && sub !== "save") {
-        throw new Error(`未知子命令：${sub}`);
       }
 
       await msg.edit({ text: `⏳ 正在保存${kindLabel(sticker.kind)}贴纸…` });
@@ -449,7 +451,7 @@ class StsavePlugin extends Plugin {
         `唯一混合贴纸包：${value}\n` +
         `保存类型：静态 WebP / 动态 TGS / 视频 WebM\n` +
         `默认表情：${htmlEscape(config.defaultEmoji)}\n\n` +
-        `回复贴纸、图片、GIF 或视频发送 <code>${mainPrefix}st</code> 即可保存。`,
+        `回复贴纸、图片、GIF 或视频发送 <code>${mainPrefix}stsave save</code> 即可保存。`,
       parseMode: "html",
       linkPreview: false,
     });

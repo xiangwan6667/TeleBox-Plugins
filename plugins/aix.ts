@@ -4481,6 +4481,7 @@ class ModelFeature extends BaseFeatureHandler {
   ): Promise<void> {
     const configManager = await this.getConfigManager();
     const config = configManager.getConfig();
+    const commandName = `${getPrefixes()[0] || "."}aix`;
 
     if (args.length < 2) {
       await this.editMessage(
@@ -4512,14 +4513,14 @@ class ModelFeature extends BaseFeatureHandler {
         await this.editMessage(
           msg,
           `🗂️ <b>模型预设:</b>\n\n${lines}\n\n` +
-            `添加：<code>.aix model preset add 配置名 提供商 模型</code>\n` +
-            `删除：<code>.aix model preset del 配置名</code>`,
+            `添加：<code>${commandName} model preset add 配置名 提供商 模型</code>\n` +
+            `删除：<code>${commandName} model preset del 配置名</code>`,
         );
         return;
       }
 
       if (action === "add" || action === "set") {
-        requireUser(args.length >= 6, "用法：.aix model preset add 配置名 提供商 模型");
+        requireUser(args.length >= 6, `用法：${commandName} model preset add 配置名 提供商 模型`);
         const presetName = args[3]?.trim();
         const tag = args[4]?.trim();
         const model = args.slice(5).join(" ").trim();
@@ -4539,7 +4540,7 @@ class ModelFeature extends BaseFeatureHandler {
 
       if (action === "del" || action === "delete" || action === "remove") {
         const presetName = args[3]?.trim();
-        requireUser(!!presetName, "用法：.aix model preset del 配置名");
+        requireUser(!!presetName, `用法：${commandName} model preset del 配置名`);
         requireUser(!!config.modelPresets[presetName], `模型预设 "${presetName}" 不存在`);
         await configManager.updateConfig((cfg) => {
           delete cfg.modelPresets[presetName];
@@ -4568,7 +4569,7 @@ class ModelFeature extends BaseFeatureHandler {
       const preset = config.modelPresets?.[presetName];
       requireUser(
         !!preset,
-        `模型预设 "${presetName}" 不存在；请先用 .aix model preset add 配置名 提供商 模型 添加`,
+        `模型预设 "${presetName}" 不存在；请先用 ${commandName} model preset add 配置名 提供商 模型 添加`,
       );
       tag = preset.tag;
       model = preset.model;
@@ -4627,6 +4628,7 @@ class PromptFeature extends BaseFeatureHandler {
   ): Promise<void> {
     const configManager = await this.getConfigManager();
     const config = configManager.getConfig();
+    const commandName = `${getPrefixes()[0] || "."}aix`;
 
     if (args.length < 2) {
       const rules = Object.entries(config.imagePromptRules || {});
@@ -4637,8 +4639,8 @@ class PromptFeature extends BaseFeatureHandler {
         msg,
         `💭 <b>当前提示词:</b>\n\n📝 内容: <code>${htmlEscape(config.prompt || "未设置")}</code>\n\n` +
         `🖼️ <b>生图关键词规则:</b>\n${ruleLines}\n\n` +
-        `<code>.aix prompt rule add 关键词 规则内容</code>\n` +
-        `<code>.aix prompt rule del 关键词</code>`,
+        `<code>${commandName} prompt rule add 关键词 规则内容</code>\n` +
+        `<code>${commandName} prompt rule del 关键词</code>`,
       );
       return;
     }
@@ -4647,7 +4649,7 @@ class PromptFeature extends BaseFeatureHandler {
     if (action === "rule") {
       const ruleAction = args[2]?.toLowerCase();
       if (ruleAction === "add") {
-        requireUser(args.length >= 5, "用法：.aix prompt rule add 关键词 规则内容");
+        requireUser(args.length >= 5, `用法：${commandName} prompt rule add 关键词 规则内容`);
         const keyword = args[3]?.trim();
         const rule = args.slice(4).join(" ").trim();
         requireUser(!!keyword && !!rule, "关键词和规则内容不能为空");
@@ -4662,7 +4664,7 @@ class PromptFeature extends BaseFeatureHandler {
       }
       if (ruleAction === "del" || ruleAction === "rm" || ruleAction === "remove") {
         const keyword = args.slice(3).join(" ").trim();
-        requireUser(!!keyword, "用法：.aix prompt rule del 关键词");
+        requireUser(!!keyword, `用法：${commandName} prompt rule del 关键词`);
         requireUser(!!config.imagePromptRules?.[keyword], `关键词规则不存在：${keyword}`);
         await configManager.updateConfig((cfg) => {
           delete cfg.imagePromptRules[keyword];
@@ -4678,7 +4680,7 @@ class PromptFeature extends BaseFeatureHandler {
         await this.editMessage(msg, `🖼️ <b>生图关键词规则</b>\n\n${lines}`);
         return;
       }
-      throw new UserError("用法：.aix prompt rule add|del|list");
+      throw new UserError(`用法：${commandName} prompt rule add|del|list`);
     }
 
     if (action === "set") {
@@ -4986,7 +4988,7 @@ class QuestionFeature extends BaseFeatureHandler {
     ) {
       const prefixes = getPrefixes();
       throw new UserError(
-        `请先配置 API 并设置模型\n使用 ${prefixes[0]}aix config add <tag> <url> <key> [type] 和 ${prefixes[0]}aix model chat <tag> <model-path>`,
+        `请先配置 API 并设置模型\n使用 ${prefixes[0] || "."}aix config add 标签 URL 密钥 [类型] 和 ${prefixes[0] || "."}aix model chat 标签 模型`,
       );
     }
 
@@ -5141,7 +5143,7 @@ class SearchFeature extends BaseFeatureHandler {
       !config.configs[config.currentSearchTag]
     ) {
       throw new UserError(
-        `请先配置 API 并设置模型\n使用 ${prefixes[0]}aix config add <tag> <url> <key> [type] 和 ${prefixes[0]}ai model search <tag> <model-path>`,
+        `请先配置 API 并设置模型\n使用 ${prefixes[0] || "."}aix config add 标签 URL 密钥 [类型] 和 ${prefixes[0] || "."}aix model search 标签 模型`,
       );
     }
 
@@ -5689,7 +5691,7 @@ class ImageFeature extends BaseFeatureHandler {
     const request = this.parseRequest(args);
     request.optimize ||= config.promptOptimize !== false;
     requireUser(!!config.currentImageTag && !!config.currentImageModel && !!config.configs[config.currentImageTag],
-      "请先配置 API，并使用 aix model image 设置图片模型");
+      `请先配置 API，并使用 ${getPrefixes()[0] || "."}aix model image 标签 模型 设置图片模型`);
     if (request.optimize) requireUser(!!config.currentChatTag && !!config.currentChatModel && !!config.configs[config.currentChatTag],
       "图片提示词优化已开启，请先配置聊天模型");
 
@@ -5898,7 +5900,7 @@ class VideoFeature extends BaseFeatureHandler {
       !config.configs[config.currentVideoTag]
     ) {
       throw new UserError(
-        `请先配置 API 并设置模型\n使用 ${prefixes[0]}aix config add <tag> <url> <key> [type] 和 ${prefixes[0]}aix model video <tag> <model-path>`,
+        `请先配置 API 并设置模型\n使用 ${prefixes[0] || "."}aix config add 标签 URL 密钥 [类型] 和 ${prefixes[0] || "."}aix model video 标签 模型`,
       );
     }
 
@@ -6067,7 +6069,7 @@ class AIXPlugin extends Plugin {
 
   private getMainPrefix(): string {
     const prefixes = getPrefixes();
-    return prefixes[0] || "";
+    return prefixes[0] || ".";
   }
 
   private registerFeatures(): void {
@@ -6104,66 +6106,49 @@ class AIXPlugin extends Plugin {
     const mainPrefix = this.getMainPrefix();
     const config = (await this.configManagerPromise).getConfig();
 
-    const baseDescription = `<b>🤖 AIX 智能助手</b>
+    const baseDescription = `<b>AIX · AI 助手</b>
 
-<b>💬 主要用法:</b>
-• <code>${mainPrefix}aix input</code> - 向 AI 发起提问
-• <code>${mainPrefix}aix search prompt</code> - 联网搜索并回答
-• <code>${mainPrefix}aix image prompt</code> - 生图/回复改图/多图结合
-• <code>${mainPrefix}aix image 2 prompt</code> - 生成2张图片
-• <code>${mainPrefix}aix image aa prompt</code> - 同时参考被回复者与命令发送者的头像
-• <code>${mainPrefix}aix image aa 2 prompt</code> - 双头像生成2张图片
-• <code>${mainPrefix}aix image ac [prompt]</code> - 同时参考被回复消息发布者的头像与消息内容，可不填提示词
-• <code>${mainPrefix}aix image ac --n 2 prompt</code> - 结合发布者头像和消息内容生成2张图片
-• <code>${mainPrefix}aix image p 1,3 prompt</code> - 从被回复消息起，选第1、3条消息作者的头像
-• <code>${mainPrefix}aix image p 1,3 --n 2 prompt</code> - 按序号选择头像并生成2张图片
-• <code>${mainPrefix}aix video prompt</code> - 文生/参考图生成视频
-• <code>${mainPrefix}aix video first prompt</code> - 首帧生成视频
-• <code>${mainPrefix}aix video firstlast prompt</code> - 首尾帧生成视频
-• <code>a</code> - 用于识别回复目标头像
-• <code>aa</code> - 需要回复消息；IMAGE A 为被回复者头像，IMAGE B 为命令发送者头像，可再附带最多4张图片
-• <code>ac</code> - 需要回复消息；IMAGE A 为发布者头像，后续参考图为消息中的图片/贴纸及本次附图，消息原文也会用于生图
-• <code>p</code> - 被回复消息算第1条，按时间向后计数，服务消息和 aix 命令不计入；按输入顺序使用头像，头像与附图合计最多6张
-• 多图结合：一次发送多张图片，或回复图片后附带其他图片
-• 发送图片时，命令和 prompt 必须写在图片下方的说明中
-• 例如：<code>${mainPrefix}aix image 2 prompt</code> / <code>${mainPrefix}aix image a prompt</code> / <code>${mainPrefix}aix image a 2 prompt</code>
-• 组合用法：回复目标消息并附带多张图片，在图片说明中输入 <code>${mainPrefix}aix image a 2 prompt</code>，可结合头像与多张图片生成2张
+<b>使用</b>
+• <code>${mainPrefix}aix 文字</code> — 提问；回复消息发送主命令可针对回复提问
+• <code>${mainPrefix}aix a [问题]</code> — 回复消息并识别其作者头像
+• <code>${mainPrefix}aix search 文字</code> — 联网搜索
+• <code>${mainPrefix}aix image [数量] 文字</code> — 生图或回复图片改图
+• <code>${mainPrefix}aix image a 文字</code> — 参考被回复者头像
+• <code>${mainPrefix}aix image aa 文字</code> — 参考被回复者和自己的头像
+• <code>${mainPrefix}aix image ac [文字]</code> — 参考发布者头像与消息内容
+• <code>${mainPrefix}aix image p 1,3 文字</code> — 按消息序号选取头像
+• <code>${mainPrefix}aix video [first|firstlast] 文字</code> — 生视频或指定首帧、首尾帧
+• <code>${mainPrefix}aix video a 文字</code> — 参考被回复者头像生成视频
+• <code>${mainPrefix}aix stop</code> — 取消当前任务
+• <code>${mainPrefix}aix help</code> — 查看帮助
+生图 / 视频数量也可用 <code>--n 2</code>；头像与附图合计最多 6 张。
 
-<b>⚙️ 配置:</b>
-• <code>${mainPrefix}aix config list</code> - 查看配置
-• <code>${mainPrefix}aix config add tag url key [type]</code> - 添加配置，未填 type 时按链接自动识别
-• <code>${mainPrefix}aix config del tag</code> - 删除配置
-• <code>${mainPrefix}aix config type tag openai-compatible|openai|gemini|doubao|moonshot|local-cliproxy</code> - 修改配置类型
-• <code>${mainPrefix}aix config stream tag on|off</code> - 流式开关
-• <code>${mainPrefix}aix config responses tag on|off</code> - Responses API 开关
+<b>配置</b>
+• <code>${mainPrefix}aix config</code> — 查看 API 配置
+• <code>${mainPrefix}aix config add 标签 URL 密钥 [类型]</code> — 添加配置
+• <code>${mainPrefix}aix config del 标签</code> — 删除配置
+• <code>${mainPrefix}aix config type 标签 类型</code> — 修改接口类型
+类型：openai-compatible / openai / gemini / doubao / moonshot / local-cliproxy
+• <code>${mainPrefix}aix config stream 标签 on|off</code> — 流式开关
+• <code>${mainPrefix}aix config responses 标签 on|off</code> — Responses API 开关
+• <code>${mainPrefix}aix model</code> — 查看当前模型
+• <code>${mainPrefix}aix model chat|search|image|video 标签 模型</code> — 设置模型
+• <code>${mainPrefix}aix model preset add 名称 标签 模型</code> — 保存模型预设
+• <code>${mainPrefix}aix model preset list</code> / <code>${mainPrefix}aix model preset del 名称</code> — 查看 / 删除预设
+• <code>${mainPrefix}aix model chat|search|image|video 名称</code> — 使用预设
+• <code>${mainPrefix}aix prompt</code> / <code>${mainPrefix}aix prompt set 文字</code> / <code>${mainPrefix}aix prompt del</code> — 查看 / 设置 / 删除提示词
+• <code>${mainPrefix}aix prompt rule add 关键词 规则</code> — 添加生图规则
+• <code>${mainPrefix}aix prompt rule list</code> / <code>${mainPrefix}aix prompt rule del 关键词</code> — 查看 / 删除规则
 
-<b>🤖 模型:</b>
-• <code>${mainPrefix}aix model</code> - 查看当前模型
-• <code>${mainPrefix}aix model chat tag model</code> - 设置对话模型
-• <code>${mainPrefix}aix model search tag model</code> - 设置搜索模型
-• <code>${mainPrefix}aix model image tag model</code> - 设置图片模型
-• <code>${mainPrefix}aix model video tag model</code> - 设置视频模型
-• <code>${mainPrefix}aix model preset add 配置名 提供商 模型</code> - 保存命名模型预设
-• <code>${mainPrefix}aix model preset list</code> - 查看模型预设
-• <code>${mainPrefix}aix model preset del 配置名</code> - 删除模型预设
-• <code>${mainPrefix}aix model chat 配置名</code> - 用预设一键切换（search/image/video 同理）
-
-<b>🛠 其他:</b>
-• <code>${mainPrefix}aix image optimize on|off</code> - 图片提示词优化
-• <code>${mainPrefix}aix image optimize short|medium|long</code> - 图片优化提示词长度（80-180 / 150-300 / 250-500 字）
-• <code>${mainPrefix}aix prompt rule add 关键词 规则内容</code> - 添加命中关键词后自动注入的生图优化规则
-• <code>${mainPrefix}aix prompt rule list</code> - 查看生图关键词规则
-• <code>${mainPrefix}aix prompt rule del 关键词</code> - 删除生图关键词规则
-• <code>${mainPrefix}aix video optimize on|off</code> - 视频提示词优化
-• <code>${mainPrefix}aix video optimize length</code> - 视频优化提示词长度（short 120-260 / medium 200-400 / long 300-600 字）
-• <code>${mainPrefix}aix image preview on|off</code> - 图片预览
-• <code>${mainPrefix}aix video preview on|off</code> - 视频预览
-• <code>${mainPrefix}aix video audio on|off</code> - 视频音频
-• <code>${mainPrefix}aix video duration 秒数</code> - 视频时长
-• <code>${mainPrefix}aix collapse on|off</code> - 折叠输出
-• <code>${mainPrefix}aix telegraph on|off</code> - 长文 Telegraph
-• <code>${mainPrefix}aix timeout 秒数</code> - 设置超时
-• <code>${mainPrefix}aix stop</code> - 取消正在执行的 AIX 任务`;
+<b>其他</b>
+• <code>${mainPrefix}aix image optimize on|off|short|medium|long</code> — 图片提示词优化
+• <code>${mainPrefix}aix video optimize on|off|short|medium|long</code> — 视频提示词优化
+• <code>${mainPrefix}aix image preview on|off</code> / <code>${mainPrefix}aix video preview on|off</code> — 图片 / 视频预览
+• <code>${mainPrefix}aix video audio on|off</code> / <code>${mainPrefix}aix video duration 秒数</code> — 视频音频 / 时长
+• <code>${mainPrefix}aix collapse on|off</code> — 折叠输出
+• <code>${mainPrefix}aix telegraph on|off</code> — 长文 Telegraph
+• <code>${mainPrefix}aix telegraph limit 数量</code> / <code>${mainPrefix}aix telegraph del 序号|all</code> — 管理记录
+• <code>${mainPrefix}aix timeout 秒数</code> — 设置超时`;
 
     if (!config.collapse) return baseDescription;
     return `<blockquote expandable>${baseDescription}</blockquote>`;

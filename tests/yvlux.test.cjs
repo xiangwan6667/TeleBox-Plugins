@@ -70,11 +70,12 @@ const client = {
   sendFile: async (_, options) => { sent.push({...options, bytes: fs.readFileSync(options.file)}); },
 };
 const exportsObj = {};
+let testPrefixes = ['.'];
 const mockRequire = name => {
   if (name === 'axios') return {default: axios};
   if (name === 'sharp') return {default: sharp};
   if (name === 'teleproto') return {Api};
-  if (name === '@utils/pluginManager') return {getPrefixes: () => ['.']};
+  if (name === '@utils/pluginManager') return {getPrefixes: () => testPrefixes};
   if (name === '@utils/pluginBase') return {Plugin: class {}};
   if (name === '@utils/pathHelpers') return {createDirectoryInAssets: () => __dirname};
   if (name === '@utils/runtimeManager') return {getGlobalClient: async () => client};
@@ -530,6 +531,9 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
   assert.match(compactHelp,/g "标签"/);assert.match(compactHelp,/组合示例/);assert.equal(plugin.description,compactHelp);
   assert.match(compactHelp,/单条、多条均可组合/);assert.match(compactHelp,/多条时 n\/g/);
   assert.match(compactHelp,/<code>\.yvlux n "名字" g "标签" t "正文"<\/code>/,'help includes a complete single-message combination');
+  assert.match(compactHelp,/\.yvlux save/);assert.match(compactHelp,/\.yvlux config api URL.*reset/);
+  await run('.yvlux t save',[message(10,'原文')]);
+  assert.equal(quoteInputs[0].messages[0].text,'save','literal save remains available as quote text');
   assert.ok(compactHelp.replace(/<[^>]+>/g,'').length<450,'help stays compact');assert.doesNotMatch(compactHelp,/增强版|高光|本地合成|旧接口|后端/);
   console.log('PASS: numeric n/t/g command, 36 option orders, spaced/smart-quoted/copied options, right-aligned plain tags, all 48 r/n/t/g selector combinations, author scope, and compact help.');
   if(process.argv.includes('--layout-only'))return;
@@ -654,12 +658,17 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
     const savedUrl=JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl;
     assert.match(await route('api reset r'),/单独使用/);assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,savedUrl);
     assert.match(await route('api reset'),/重置/);assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,'');
+    assert.match(await route('config api example.org'),/https:\/\/example.org\/generate.webp/);
+    assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,'https://example.org/generate.webp');
+    assert.match(await route('config api reset r'),/单独使用/);
+    assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,'https://example.org/generate.webp');
+    assert.match(await route('config api reset'),/重置/);assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).apiUrl,'');
     assert.match(await route('config'),/当前配置/);assert.match(await route('config sticker UpdatedQuotes'),/已设置/);
     assert.equal(JSON.parse(fs.readFileSync(plugin.configPath)).stickerSetShortName,'UpdatedQuotes');
     assert.match(await route('config sticker bad-name'),/字母、数字和下划线/);
     assert.match(await route('s r'),/单独使用/);assert.match(await route('s'),/请回复/);assert.match(await route('s',message(10,'text')),/不包含媒体/);
     const image={...message(10,''),media:new Api.MessageMediaPhoto({}),downloadMedia:async()=>photo};
-    assert.match(await route('s',image),/成功/);assert.equal(uploads.length,1);assert.ok(calls.some(c=>c.className==='messages.UploadMedia'));
+    assert.match(await route('save',image),/成功/);assert.equal(uploads.length,1);assert.ok(calls.some(c=>c.className==='messages.UploadMedia'));
     packExists=false;assert.match(await route('s',image),/创建竣工/);assert.equal(uploads.length,2);
     for(const mime of ['image/webp','application/x-tgsticker','video/webm']) {
       calls=[];const sticker={...message(10,''),media:new Api.MessageMediaDocument({document:{id:33,accessHash:44,mimeType:mime,attributes:[new Api.DocumentAttributeSticker({})]}})};
@@ -668,6 +677,14 @@ async function run(command, messages, extra = {}, expectedImages = 1) {
       const create=calls.find(c=>c.className==='stickers.CreateStickerSet');assert.equal(!!create.animated,mime==='application/x-tgsticker');assert.equal(!!create.videos,mime==='video/webm');
     }
   } finally {fs.unlinkSync(plugin.configPath);fs.rmdirSync(configDir);}
+  for (const [prefixes, expected] of [[['!'], '!yvlux help'], [[], '.yvlux help']]) {
+    testPrefixes = prefixes;
+    const fresh = {};
+    vm.runInNewContext(compiled.outputText, {require: mockRequire, exports: fresh, Buffer, console: {log() {}, warn() {}, error() {}}});
+    let text = '';
+    await fresh.default.cmdHandlers.yvlux({message: expected, edit: async options => {text = options.text;}});
+    assert.ok(text.includes(expected), 'help follows the configured prefix or its default');
+  }
   console.log('PASS: help, configuration persistence/validation, API reset/isolation, photo upload and existing/new sticker packs, static/TGS/video sticker preservation (mock Telegram).');
   console.log('PASS: syntax/rendering; unboxed single-line full names; larger body glyphs; combined p/r/n/t; quoted/legacy parsing; five-message cap with arbitrary pick positions; rename scope; send errors and cleanup; media/API compatibility.');
 })().catch(e => {console.error(e); process.exitCode = 1;});

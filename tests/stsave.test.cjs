@@ -61,19 +61,21 @@ const client={
   },
 };
 const exportsObj={};
-vm.runInNewContext(compiled.outputText+'\nexports._convert=convertVideoToWebm;exports._probe=probeStickerVideo;exports._friendly=friendlyError;',{
-  exports:exportsObj,Buffer,console:{error(){},warn(){}},require(name){
+let testPrefixes=['.'];
+function mockRequire(name){
     if(name==='teleproto')return {Api};
     if(name==='sharp')return sharp;
     if(name==='child_process')return {execFile:trackedExecFile};
     if(name==='@utils/pluginBase')return {Plugin:class{}};
-    if(name==='@utils/pluginManager')return {getPrefixes:()=>['.']};
+    if(name==='@utils/pluginManager')return {getPrefixes:()=>testPrefixes};
     if(name==='@utils/runtimeManager')return {getGlobalClient:async()=>client};
     if(name==='@utils/pathHelpers')return {createDirectoryInAssets:()=>temp};
     if(name==='@utils/authGuards')return {safeGetMe:async()=>new Api.User({id:7,username:'tester'})};
     if(name==='@utils/safeGetMessages')return {safeGetReplyMessage:async message=>message.reply};
     return require(name);
-  },
+}
+vm.runInNewContext(compiled.outputText+'\nexports._convert=convertVideoToWebm;exports._probe=probeStickerVideo;exports._friendly=friendlyError;',{
+  exports:exportsObj,Buffer,console:{error(){},warn(){}},require:mockRequire,
 });
 const plugin=exportsObj.default;
 function sticker(mime='video/webm'){
@@ -153,7 +155,35 @@ async function frame(file,time){
   assert.match(await command({media:new Api.MessageMediaDocument({document:new Api.Document({mimeType:'image/gif',attributes:[]})})}),/贴纸保存成功/);
   await inspectVideo(state.uploads[0].bytes);
   console.log('PASS: MP4/GIF conversion sends matching image/video size attributes, removes audio, and preserves transparent padding.');
-  reset();assert.match(await command(undefined,'.stsave help'),/贴纸保存插件/);
+  reset();
+  for(const help of ['.stsave help','.stsave h','.stsave ?','.st help']) {
+    assert.match(await command(undefined,help),/STSAVE · 贴纸保存/);
+  }
+  assert.match(await command(undefined,'.stsave config'),/TestQuotes/);
+  assert.match(await command(undefined,'.stsave config emoji 🌸'),/已设置/);
+  assert.equal(JSON.parse(fs.readFileSync(configPath)).defaultEmoji,'🌸');
+  assert.match(await command(undefined,'.stsave config sticker OtherQuotes'),/已设置/);
+  assert.equal(JSON.parse(fs.readFileSync(configPath)).pack,'OtherQuotes');
+  assert.match(await command(undefined,'.stsave set static TestQuotes'),/已设置/);
+  assert.equal(JSON.parse(fs.readFileSync(configPath)).pack,'TestQuotes','legacy typed set still works');
+  assert.match(await command(undefined,'.st config auto'),/自动/);
+  assert.equal(JSON.parse(fs.readFileSync(configPath)).pack,'');
+  assert.match(await command(undefined,'.stsave config sticker static'),/已设置/);
+  assert.equal(JSON.parse(fs.readFileSync(configPath)).pack,'static','canonical syntax treats static as a pack name');
+  reset({input});
+  assert.match(await command(sticker(),'.stsave save'),/贴纸保存成功/);
+  assert.match(await command(videoMessage,'.stsave unknown'),/未知子命令/);
+  assert.match(await command(videoMessage,'.stsave to bad-name'),/贴纸包短名称/);
+  assert.equal(state.downloads,0,'invalid commands never start media conversion');
+  assert.equal(state.uploads.length,0);
+  for(const [prefixes,expected] of [[['!'],'!stsave help'],[[],'.stsave help']]){
+    testPrefixes=prefixes;
+    const fresh={};
+    vm.runInNewContext(compiled.outputText,{exports:fresh,Buffer,console:{error(){},warn(){}},require:mockRequire});
+    let text='';
+    await fresh.default.cmdHandlers.stsave({message:expected,edit:async options=>{text=options.text;}});
+    assert.ok(text.includes(expected),'help follows the configured prefix or its default');
+  }
   assert.equal(exportsObj._friendly({errorMessage:'STICKER_VIDEO_DIMENSIONS'}).includes('512px'),true);
   console.log('PASS: stsave local regressions; all Telegram operations mocked, actual ffmpeg/ffprobe used.');
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>{

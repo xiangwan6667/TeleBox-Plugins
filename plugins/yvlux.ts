@@ -294,7 +294,7 @@ const resolveForwardSenderFromHeader = async (forwardHeader: Api.MessageFwdHeade
 };
 
 const prefixes = getPrefixes();
-const mainPrefix = prefixes[0];
+const mainPrefix = prefixes[0] || ".";
 // 使用 yvlux 避免与官方 yvlu 插件的命令重名；保留配置目录 assets/yvlu，迁移时不会丢失现有设置。
 const pluginName = "yvlux";
 const commandName = `${mainPrefix}${pluginName}`;
@@ -421,25 +421,24 @@ const help_text = `
 <b>YVLUX · 语录贴纸</b>
 回复消息使用，一次最多选择 5 条。
 
-<b>生成语录</b>
+<b>使用</b>
 • <code>${commandName} [数量]</code> — 单条 / 连续多条
 • <code>${commandName} p 1,3,6</code> — 跳选消息
 • <code>${commandName} r [数量]</code> — 包含回复引用
 • <code>${commandName} n "名字"</code> — 自定义姓名
-• <code>${commandName} g "标签"</code> — 自定义标签
-• <code>${commandName} g ""</code> — 隐藏标签
+• <code>${commandName} g "标签"</code> — 自定义标签；<code>g ""</code> 隐藏
 • <code>${commandName} 文字</code> — 自定义正文
+• <code>${commandName} save</code> — 保存图片 / 贴纸
+• <code>${commandName} help</code> — 查看帮助
 
 <b>组合示例</b>
 <code>${commandName} n "名字" g "标签" t "正文"</code>
-<code>${commandName} p 1,3 r t "文字"</code>
-单条、多条均可组合；数量与 p 二选一。多条时 n/g 改首条作者，t 改首条所选消息。带空格或与选项同名的内容加引号。
+单条、多条均可组合；数量与 p 二选一。多条时 n/g 改首条作者，t 改首条消息。含空格或选项同名请加引号。
 
-<b>贴纸与设置（单独使用）</b>
-• <code>${commandName} s</code> — 保存图片 / 贴纸
+<b>配置（单独使用）</b>
+• <code>${commandName} config</code> — 查看配置
 • <code>${commandName} config sticker 名称</code> — 设置贴纸包
-• <code>${commandName} api URL</code> — 设置接口
-• <code>${commandName} api reset</code> — 重置接口
+• <code>${commandName} config api URL</code> — 设置接口，URL 用 reset 重置
 `;
 
 /**
@@ -1338,7 +1337,7 @@ class YvluPlugin extends Plugin {
       }
 
       // 3. 保存贴纸/图片路由
-      if (subCmd === "s") {
+      if (subCmd === "s" || (subCmd === "save" && args.length === 2)) {
         if (args.length !== 2) { await msg.edit({ text: "s 保存模式请单独使用，不与生成选项组合" }); return; }
         await this.handleSaveStickerToSet(msg);
         return;
@@ -1710,7 +1709,7 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
 
 <b>可用配置命令:</b>
 <code>${commandName} config sticker 贴纸包名称</code> - 设置贴纸包名称
-<code>${commandName} api [URL]</code> - 设置 API
+<code>${commandName} config api [URL]</code> - 设置 API
 `;
         await msg.edit({ text: configInfo, parseMode: "html" });
         return;
@@ -1719,6 +1718,9 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
       const subCommand = args[0].toLowerCase();
 
       switch (subCommand) {
+        case "api":
+          await this.handleApiCommand(msg, args.slice(1));
+          return;
         case "sticker":
         case "stickerset":
         case "set": {
@@ -1770,7 +1772,7 @@ ${this.config?.stickerSetShortName ? `<b>贴纸包链接:</b> t.me/addstickers/$
       const sub = args[0];
 
       if (!sub) {
-        await msg.edit({ text: `当前 API: <code>${this.config?.apiUrl || "默认"}</code>\n使用 <code>${commandName} api reset</code> 恢复默认。`, parseMode: "html" });
+        await msg.edit({ text: `当前 API: <code>${this.config?.apiUrl || "默认"}</code>\n使用 <code>${commandName} config api reset</code> 恢复默认。`, parseMode: "html" });
       } else if (sub.toLowerCase() === "reset") {
         this.config!.apiUrl = "";
         await this.saveConfig();

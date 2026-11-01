@@ -1,11 +1,18 @@
 import { Api } from "teleproto";
 import { Raw } from "teleproto/events";
 import { Plugin } from "@utils/pluginBase";
+import { getPrefixes } from "@utils/pluginManager";
 import { safeGetMe } from "@utils/authGuards";
 
+const mainPrefix = getPrefixes()[0] || ".";
 const VOTE_TTL_MS = 5 * 60 * 1000;
 const REQUIRED_VOTES = 3;
 const APPROVAL_REACTION = "👍";
+const helpText = `<b>BAN_AD_SPAM · 广告举报投票</b>\n\n` +
+  `<b>使用</b>\n` +
+  `• 他人回复目标消息、@你并包含 <code>ban广告</code> 时，自动发起投票\n` +
+  `• 5 分钟内达到 3 个 👍 后，自动回复目标消息 <code>/spam</code>\n` +
+  `• <code>${mainPrefix}ban_ad_spam help</code> — 查看帮助`;
 
 type Vote = {
   peer: any;
@@ -67,8 +74,12 @@ function voteText(count: number, expiresAt: number): string {
 
 class BanAdSpamPlugin extends Plugin {
   name = "ban_ad_spam";
-  description = "ban广告触发 5 分钟、3 个 👍 同意的 /spam 投票";
-  cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {};
+  description = helpText;
+  cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
+    ban_ad_spam: async (msg) => {
+      await msg.edit({ text: helpText, parseMode: "html", linkPreview: false });
+    },
+  };
   eventHandlers = [
     {
       event: new Raw({ types: [Api.UpdateMessageReactions] }),
